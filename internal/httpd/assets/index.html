@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tidymail</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <nav class="sidebar">
+    <div class="brand">
+      <span class="brand-name">tidymail</span>
+      <button type="button" id="refresh" class="ghost" title="Show mail fetched by tidymail sync (g)">Refresh</button>
+    </div>
+
+    <ul class="boxes" id="boxes"></ul>
+
+    <form class="newbox" id="newbox-form">
+      <input type="text" id="newbox-name" placeholder="New box…" maxlength="60" autocomplete="off">
+      <button type="submit" class="ghost">Add</button>
+    </form>
+
+    <div class="sidebar-foot" id="stats"></div>
+  </nav>
+
+  <section class="list-pane">
+    <div class="searchbar">
+      <input type="search" id="search" placeholder="Search  (from:ann invoice)" autocomplete="off">
+      <label class="toggle"><input type="checkbox" id="unread-only"> unread</label>
+    </div>
+    <div class="list-head">
+      <span id="list-head"></span>
+      <button type="button" id="archive-all" class="ghost small" title="Move everything in Unprocessed to Processed" hidden>Archive all</button>
+    </div>
+    <ul class="messages" id="messages"></ul>
+    <div class="pager">
+      <button type="button" id="prev-page" class="ghost">← newer</button>
+      <span id="page-info"></span>
+      <button type="button" id="next-page" class="ghost">older →</button>
+    </div>
+  </section>
+
+  <section class="read-pane" id="read-pane">
+    <div class="empty" id="empty-state">
+      <p>Pick a message.</p>
+      <dl class="keys">
+        <dt>j / k</dt><dd>next / previous</dd>
+        <dt>r</dt><dd>reply, then Processed</dd>
+        <dt>i</dt><dd>ignore: blacklist sender, to Spam</dd>
+        <dt>p</dt><dd>priority</dd>
+        <dt>d</dt><dd>delay for N days</dd>
+        <dt>m</dt><dd>move to a box</dd>
+        <dt>#</dt><dd>delete: to Trash, also on IMAP</dd>
+        <dt>/</dt><dd>search</dd>
+        <dt>g</dt><dd>refresh</dd>
+      </dl>
+    </div>
+
+    <article class="message" id="message" hidden>
+      <header class="msg-head">
+        <h1 id="msg-subject"></h1>
+        <div class="msg-meta">
+          <span id="msg-from" class="from"></span>
+          <span id="msg-date" class="date"></span>
+        </div>
+        <div class="msg-meta secondary">
+          <span id="msg-to"></span>
+        </div>
+        <div class="msg-flags" id="msg-flags"></div>
+      </header>
+
+      <div class="actions">
+        <button type="button" data-act="reply" class="primary">Reply <kbd>r</kbd></button>
+        <button type="button" data-act="ignore">Ignore <kbd>i</kbd></button>
+        <button type="button" data-act="prio">Prio <kbd>p</kbd></button>
+        <button type="button" data-act="delay">Delay <kbd>d</kbd></button>
+        <button type="button" data-act="move">Move <kbd>m</kbd></button>
+        <button type="button" data-act="delete" class="danger" title="Move to Trash, here and on the IMAP server">Delete <kbd>#</kbd></button>
+        <a id="msg-raw" class="button ghost" href="#" download>Source</a>
+      </div>
+
+      <ul class="attachments" id="attachments"></ul>
+      <pre class="body" id="msg-body"></pre>
+    </article>
+
+    <form class="compose" id="compose" hidden>
+      <div class="compose-head">
+        <span id="compose-to"></span>
+        <button type="button" id="compose-cancel" class="ghost">Cancel</button>
+      </div>
+      <input type="text" id="compose-cc" placeholder="Cc (comma separated)" autocomplete="off">
+      <textarea id="compose-body" rows="14" placeholder="Your reply…"></textarea>
+      <div class="compose-foot">
+        <label class="toggle"><input type="checkbox" id="compose-quote" checked> quote original</label>
+        <button type="submit" class="primary">Send &amp; mark processed</button>
+      </div>
+    </form>
+  </section>
+</div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-card">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div class="modal-foot">
+      <button type="button" id="modal-cancel" class="ghost">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+</body>
+</html>

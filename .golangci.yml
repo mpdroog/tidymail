@@ -1,0 +1,94 @@
+# Strict by design: the rule for this project is that an error is either
+# returned to the caller or logged. errcheck's check-blank setting is what
+# enforces it -- `_ = doSomething()` is a lint failure, not a shortcut.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errcheck
+    - errorlint
+    - forbidigo
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - makezero
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - wastedassign
+
+  settings:
+    errcheck:
+      # Every returned error must be handled...
+      check-type-assertions: true
+      # ...and discarding one into the blank identifier counts as ignoring it.
+      check-blank: true
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # readability of the struct beats a few padding bytes
+
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: indent-error-flow
+        - name: var-naming
+        - name: receiver-naming
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    gosec:
+      excludes:
+        - G104 # duplicate of errcheck, which is stricter here
+
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print.*$
+          msg: use the injected *log.Logger so output goes to one place
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - whyNoLint
+        - hugeParam
+
+  exclusions:
+    rules:
+      # Test helpers legitimately ignore cleanup errors on temp dirs.
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+      # The CLI prints usage and version to stdout by design.
+      - path: cmd/tidymail/main\.go
+        linters:
+          - forbidigo
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

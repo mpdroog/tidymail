@@ -24,17 +24,18 @@ import (
 
 // Syncer fetches mail for one account.
 type Syncer struct {
-	cfg config.IMAP
-	st  *store.Store
-	log *log.Logger
+	account string // tags stored mail and names the sync cursor
+	cfg     config.IMAP
+	st      *store.Store
+	log     *log.Logger
 
 	// Verbose also logs every stored message, not only batch statistics.
 	Verbose bool
 }
 
-// New returns a Syncer.
-func New(cfg config.IMAP, st *store.Store, logger *log.Logger) *Syncer {
-	return &Syncer{cfg: cfg, st: st, log: logger}
+// New returns a Syncer for the named account; the single unnamed account is "".
+func New(account string, cfg config.IMAP, st *store.Store, logger *log.Logger) *Syncer {
+	return &Syncer{account: account, cfg: cfg, st: st, log: logger}
 }
 
 // Result summarises one sync run.
@@ -94,7 +95,7 @@ func (s *Syncer) Sync(ctx context.Context) (res Result, err error) {
 		return res, err
 	}
 
-	cursor, err := s.st.LoadCursor()
+	cursor, err := s.st.LoadCursor(s.account)
 	if err != nil {
 		return res, err
 	}
@@ -114,7 +115,7 @@ func (s *Syncer) Sync(ctx context.Context) (res Result, err error) {
 	}
 
 	cursor.LastSync = res.At
-	if err := s.st.SaveCursor(cursor); err != nil {
+	if err := s.st.SaveCursor(s.account, cursor); err != nil {
 		return res, err
 	}
 	res.Took, res.CPU = time.Since(start), cpuTime()-cpuStart
@@ -254,7 +255,7 @@ func (s *Syncer) scanSent(ctx context.Context, c *imapclient.Client, mailbox str
 		}
 		added += n
 		cursor.SentUID = highest
-		if saveErr := s.st.SaveCursor(*cursor); saveErr != nil {
+		if saveErr := s.st.SaveCursor(s.account, *cursor); saveErr != nil {
 			return added, saveErr
 		}
 	}
@@ -339,7 +340,7 @@ func (s *Syncer) fetchInbox(ctx context.Context, c *imapclient.Client, f folders
 				s.log.Printf("imap: UID %d in %s returned an empty body, leaving it on the server", m.UID, f.inbox)
 				continue
 			}
-			stored, isNew, storeErr := s.st.Ingest(ctx, raw, m.InternalDate)
+			stored, isNew, storeErr := s.st.Ingest(ctx, s.account, raw, m.InternalDate)
 			if storeErr != nil {
 				// One unparseable message must not stall the whole sync;
 				// it stays on the server so it can be retried.
@@ -365,7 +366,7 @@ func (s *Syncer) fetchInbox(ctx context.Context, c *imapclient.Client, f folders
 		}
 		// Record progress per batch, so an interrupted sync resumes here
 		// instead of fetching everything again.
-		if saveErr := s.st.SaveCursor(*cursor); saveErr != nil {
+		if saveErr := s.st.SaveCursor(s.account, *cursor); saveErr != nil {
 			return saveErr
 		}
 		storeTime, spent := time.Since(storeStart), s.st.Timings().Sub(before)

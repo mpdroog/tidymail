@@ -32,7 +32,7 @@ func rawMail(from, to, subject, body string) []byte {
 func TestIngestRoutesToUnprocessed(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
-	m, isNew, err := s.Ingest(ctx, rawMail("Ann <ann@example.com>", "me@example.com", "hello", "first body"), time.Now())
+	m, isNew, err := s.Ingest(ctx, "", rawMail("Ann <ann@example.com>", "me@example.com", "hello", "first body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -51,10 +51,10 @@ func TestIngestIsIdempotent(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
 	raw := rawMail("ann@example.com", "me@example.com", "dup", "body")
-	if _, isNew, err := s.Ingest(ctx, raw, time.Now()); err != nil || !isNew {
+	if _, isNew, err := s.Ingest(ctx, "", raw, time.Now()); err != nil || !isNew {
 		t.Fatalf("first ingest: new=%v err=%v", isNew, err)
 	}
-	if _, isNew, err := s.Ingest(ctx, raw, time.Now()); err != nil || isNew {
+	if _, isNew, err := s.Ingest(ctx, "", raw, time.Now()); err != nil || isNew {
 		t.Fatalf("second ingest: new=%v err=%v, want new=false", isNew, err)
 	}
 	_, total, err := s.List(ctx, Query{})
@@ -69,7 +69,7 @@ func TestIngestIsIdempotent(t *testing.T) {
 func TestRewritingStateKeepsOneSearchRow(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
-	m, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "quarterly", "renewal notice"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", "quarterly", "renewal notice"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestRewritingStateKeepsOneSearchRow(t *testing.T) {
 func TestTrashIsABuiltInBox(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
-	m, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "old news", "body"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", "old news", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -112,11 +112,11 @@ func TestTrashIsABuiltInBox(t *testing.T) {
 func TestMovesAreQueuedForTheServer(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
-	m, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "queued", "body"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", "queued", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
-	pending, err := s.PendingMoves(ctx, 10)
+	pending, err := s.PendingMoves(ctx, 10, "")
 	if err != nil {
 		t.Fatalf("PendingMoves: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestMovesAreQueuedForTheServer(t *testing.T) {
 	if _, moveErr := s.SetBox(ctx, m.ID, BoxPriority); moveErr != nil {
 		t.Fatalf("SetBox: %v", moveErr)
 	}
-	pending, err = s.PendingMoves(ctx, 10)
+	pending, err = s.PendingMoves(ctx, 10, "")
 	if err != nil {
 		t.Fatalf("PendingMoves: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestMovesAreQueuedForTheServer(t *testing.T) {
 	if setErr := s.SetServerBox(ctx, m.ID, BoxPriority); setErr != nil {
 		t.Fatalf("SetServerBox: %v", setErr)
 	}
-	if pending, err = s.PendingMoves(ctx, 10); err != nil || len(pending) != 0 {
+	if pending, err = s.PendingMoves(ctx, 10, ""); err != nil || len(pending) != 0 {
 		t.Fatalf("after mirroring: pending = %+v, err = %v", pending, err)
 	}
 }
@@ -148,7 +148,7 @@ func TestMoveAllEmptiesABox(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
 	for _, subject := range []string{"one", "two"} {
-		if _, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", subject, "body"), time.Now()); err != nil {
+		if _, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", subject, "body"), time.Now()); err != nil {
 			t.Fatalf("Ingest: %v", err)
 		}
 	}
@@ -173,7 +173,7 @@ func TestWhitelistRouting(t *testing.T) {
 	if _, err := s.AddContacts("Bob@Example.com"); err != nil {
 		t.Fatalf("AddContacts: %v", err)
 	}
-	m, _, err := s.Ingest(ctx, rawMail("bob@example.com", "me@example.com", "hi", "body"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("bob@example.com", "me@example.com", "hi", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestRuleBeatsWhitelist(t *testing.T) {
 	if err := s.AddRule(Rule{Field: MatchFrom, Address: "@example.com", Box: "error-mails"}); err != nil {
 		t.Fatalf("AddRule: %v", err)
 	}
-	m, _, err := s.Ingest(ctx, rawMail("ci@example.com", "me@example.com", "build failed", "body"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("ci@example.com", "me@example.com", "build failed", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestRuleBeatsWhitelist(t *testing.T) {
 func TestDelayReturnsToOriginalBox(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
-	m, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "later", "body"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", "later", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestDelayReturnsToOriginalBox(t *testing.T) {
 func TestIgnoreBlacklistsSender(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
-	m, _, err := s.Ingest(ctx, rawMail("spam@bad.example", "me@example.com", "buy", "body"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("spam@bad.example", "me@example.com", "buy", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestIgnoreBlacklistsSender(t *testing.T) {
 		t.Errorf("box = %q, want %q", got.Box, BoxSpam)
 	}
 	// A later message from the same sender must be filed as spam on arrival.
-	next, _, err := s.Ingest(ctx, rawMail("spam@bad.example", "me@example.com", "buy again", "body"), time.Now())
+	next, _, err := s.Ingest(ctx, "", rawMail("spam@bad.example", "me@example.com", "buy again", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -306,10 +306,10 @@ func TestIgnoreBlacklistsSender(t *testing.T) {
 func TestFullTextSearch(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)
-	if _, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "invoice", "the quarterly invoice is attached"), time.Now()); err != nil {
+	if _, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", "invoice", "the quarterly invoice is attached"), time.Now()); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
-	if _, _, err := s.Ingest(ctx, rawMail("bob@example.com", "me@example.com", "lunch", "shall we get lunch"), time.Now()); err != nil {
+	if _, _, err := s.Ingest(ctx, "", rawMail("bob@example.com", "me@example.com", "lunch", "shall we get lunch"), time.Now()); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
 	for _, tc := range []struct {
@@ -338,7 +338,7 @@ func TestReindexRebuildsFromStateFiles(t *testing.T) {
 	s := testStore(t)
 	for i := 0; i < 5; i++ {
 		raw := rawMail("ann@example.com", "me@example.com", fmt.Sprintf("subject-%d", i), "body text")
-		if _, _, err := s.Ingest(ctx, raw, time.Now()); err != nil {
+		if _, _, err := s.Ingest(ctx, "", raw, time.Now()); err != nil {
 			t.Fatalf("Ingest: %v", err)
 		}
 	}
@@ -367,7 +367,7 @@ func TestDeleteCustomBoxMovesMessages(t *testing.T) {
 	if _, err := s.CreateBox("Temp Box"); err != nil {
 		t.Fatalf("CreateBox: %v", err)
 	}
-	m, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "x", "body"), time.Now())
+	m, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", "x", "body"), time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestHTMLOnlyBodyBecomesText(t *testing.T) {
 		"Content-Type: text/html; charset=utf-8\r\n\r\n" +
 		"<html><head><style>p{color:red}</style></head><body><p>Hello <b>there</b></p>" +
 		"<script>alert(1)</script><a href=\"https://example.com\">link</a></body></html>\r\n")
-	m, _, err := s.Ingest(ctx, raw, time.Now())
+	m, _, err := s.Ingest(ctx, "", raw, time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -426,5 +426,55 @@ func TestHTMLOnlyBodyBecomesText(t *testing.T) {
 	}
 	if !strings.Contains(body, "<https://example.com>") {
 		t.Errorf("body = %q, want the link target preserved", body)
+	}
+}
+
+func TestAccountsKeepTheirOwnCursorAndMoves(t *testing.T) {
+	ctx := t.Context()
+	s := testStore(t)
+	home, _, err := s.Ingest(ctx, "home", rawMail("ann@example.com", "me@home.example", "from home", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	work, _, err := s.Ingest(ctx, "work", rawMail("bob@example.com", "me@work.example", "from work", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if got, getErr := s.Get(work.ID); getErr != nil || got.Account != "work" {
+		t.Fatalf("stored account = %+v, err = %v; want work", got, getErr)
+	}
+
+	for _, id := range []string{home.ID, work.ID} {
+		if _, moveErr := s.SetBox(ctx, id, BoxPriority); moveErr != nil {
+			t.Fatalf("SetBox: %v", moveErr)
+		}
+	}
+	pending, err := s.PendingMoves(ctx, 10, "work")
+	if err != nil {
+		t.Fatalf("PendingMoves: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != work.ID || pending[0].Account != "work" {
+		t.Fatalf("work pending = %+v, want only the work message", pending)
+	}
+	if none, noneErr := s.PendingMoves(ctx, 10); noneErr != nil || len(none) != 0 {
+		t.Fatalf("no accounts: pending = %+v, err = %v", none, noneErr)
+	}
+
+	synced := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	if saveErr := s.SaveCursor("work", Cursor{InboxUID: 7, LastSync: synced}); saveErr != nil {
+		t.Fatalf("SaveCursor: %v", saveErr)
+	}
+	if c, loadErr := s.LoadCursor("home"); loadErr != nil || c.InboxUID != 0 {
+		t.Fatalf("home cursor = %+v, err = %v; want untouched", c, loadErr)
+	}
+	stats, err := s.Stats(ctx, []string{"home", "work"}, []string{"work"})
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.PendingIMAP != 1 {
+		t.Errorf("pending = %d, want only the mirrored work account's move", stats.PendingIMAP)
+	}
+	if !stats.LastSync.Equal(synced) {
+		t.Errorf("last sync = %s, want the latest of any account (%s)", stats.LastSync, synced)
 	}
 }

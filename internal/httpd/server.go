@@ -54,13 +54,20 @@ const downloadPolicy = "default-src 'none'; sandbox"
 // maxRequestBody caps a JSON request. Replies are text, so this is generous.
 const maxRequestBody = 1 << 20 // 1 MiB
 
+// Account is the pair of mail transports for one configured account.
+type Account struct {
+	Name   string // as in config; "" is the single unnamed account
+	Syncer *imapsync.Syncer
+	Sender *smtpsend.Sender
+	Mirror bool // repeat box moves in this account's IMAP folders
+}
+
 // Server wires the store, the mail transports and the HTTP handlers together.
 type Server struct {
-	cfg    *config.Config
-	st     *store.Store
-	syncer *imapsync.Syncer
-	sender *smtpsend.Sender
-	log    *log.Logger
+	cfg      *config.Config
+	st       *store.Store
+	accounts []Account // in config order; the first also owns unnamed mail
+	log      *log.Logger
 
 	csrf string
 	mux  *http.ServeMux
@@ -72,16 +79,65 @@ type Server struct {
 }
 
 // New builds the HTTP server.
-func New(cfg *config.Config, st *store.Store, syncer *imapsync.Syncer, sender *smtpsend.Sender, logger *log.Logger) (*Server, error) {
+func New(cfg *config.Config, st *store.Store, accounts []Account, logger *log.Logger) (*Server, error) {
 	token, err := randomToken()
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{cfg: cfg, st: st, syncer: syncer, sender: sender, log: logger, csrf: token, mux: http.NewServeMux(), mirrorKick: make(chan struct{}, 1)}
+	s := &Server{cfg: cfg, st: st, accounts: accounts, log: logger, csrf: token, mux: http.NewServeMux(), mirrorKick: make(chan struct{}, 1)}
 	if err := s.routes(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// ErrUnknownAccount is returned for a message fetched through an account that
+// is no longer in the config.
+var ErrUnknownAccount = errors.New("account is not configured")
+
+// account returns the transports for a message's account. An empty name is
+// the first account, like config.Config.Account.
+func (s *Server) account(name string) (Account, error) {
+	if name == "" && len(s.accounts) > 0 {
+		return s.accounts[0], nil
+	}
+	for _, a := range s.accounts {
+		if a.Name == name {
+			return a, nil
+		}
+	}
+	return Account{}, fmt.Errorf("%w: %q", ErrUnknownAccount, name)
+}
+
+// owned lists the account names whose mail belongs to accounts[i]: its own
+// name, and for the first account also mail stored before accounts had names.
+func (s *Server) owned(i int) []string {
+	names := []string{s.accounts[i].Name}
+	if i == 0 && s.accounts[i].Name != "" {
+		names = append(names, "")
+	}
+	return names
+}
+
+// mirroredNames lists the account names whose box moves are repeated on the
+// server.
+func (s *Server) mirroredNames() []string {
+	var names []string
+	for i := range s.accounts {
+		if s.accounts[i].Mirror {
+			names = append(names, s.owned(i)...)
+		}
+	}
+	return names
+}
+
+// accountNames lists the configured account names, for sync statistics.
+func (s *Server) accountNames() []string {
+	names := make([]string, 0, len(s.cfg.Accounts))
+	for i := range s.cfg.Accounts {
+		names = append(names, s.cfg.Accounts[i].Name)
+	}
+	return names
 }
 
 // randomToken returns a 256-bit URL-safe token.

@@ -52,17 +52,21 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		s.failFor(w, r, err)
 		return
 	}
-	stats, err := s.st.Stats(r.Context())
+	stats, err := s.st.Stats(r.Context(), s.accountNames(), s.mirroredNames())
 	if err != nil {
 		s.failFor(w, r, err)
 		return
+	}
+	var fromAddr string
+	if acct, ok := s.cfg.Account(""); ok {
+		fromAddr = acct.SMTP.FromAddr
 	}
 	s.writeJSON(w, r, http.StatusOK, stateView{
 		CSRF:     s.csrf,
 		Boxes:    boxes,
 		Rules:    s.st.Rules(),
 		Stats:    stats,
-		FromAddr: s.cfg.SMTP.FromAddr,
+		FromAddr: fromAddr,
 	})
 }
 
@@ -117,6 +121,7 @@ type messageView struct {
 	Body        string              `json:"body"`
 	ReplyTo     []mailparse.Address `json:"reply_targets"`
 	ReplySubj   string              `json:"reply_subject"`
+	ReplyFrom   string              `json:"reply_from"` // the account's address replies go out from
 	Whitelisted bool                `json:"whitelisted"`
 }
 
@@ -149,11 +154,16 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	var replyFrom string
+	if acct, ok := s.cfg.Account(m.Account); ok {
+		replyFrom = acct.SMTP.FromAddr
+	}
 	s.writeJSON(w, r, http.StatusOK, messageView{
 		Message:     m,
 		Body:        parsed.Text,
 		ReplyTo:     m.ReplyTargets(),
 		ReplySubj:   m.ReplySubject(),
+		ReplyFrom:   replyFrom,
 		Whitelisted: whitelisted,
 	})
 }
@@ -352,6 +362,13 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, http.StatusBadRequest, smtpsend.ErrNoRecipient)
 		return
 	}
+	// Reply through the account the message came in on, so it goes out from
+	// the address it was sent to.
+	acct, err := s.account(m.Account)
+	if err != nil {
+		s.fail(w, r, http.StatusConflict, err)
+		return
+	}
 
 	reply := smtpsend.Reply{
 		To:         targets,
@@ -378,12 +395,12 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	raw, err := s.sender.Compose(reply, now)
+	raw, err := acct.Sender.Compose(reply, now)
 	if err != nil {
 		s.failFor(w, r, err)
 		return
 	}
-	if sendErr := s.sender.Send(r.Context(), raw, smtpsend.Recipients(reply)); sendErr != nil {
+	if sendErr := acct.Sender.Send(r.Context(), raw, smtpsend.Recipients(reply)); sendErr != nil {
 		s.fail(w, r, http.StatusBadGateway, fmt.Errorf("send reply: %w", sendErr))
 		return
 	}
@@ -398,7 +415,7 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 	if _, outErr := s.st.SaveOutbox(raw, now); outErr != nil {
 		note("archiving it in mail.d/outbox", outErr)
 	}
-	if appendErr := s.syncer.AppendSent(raw, now); appendErr != nil {
+	if appendErr := acct.Syncer.AppendSent(raw, now); appendErr != nil {
 		note("copying it to the IMAP Sent folder", appendErr)
 	}
 	if _, contactErr := s.st.AddContacts(smtpsend.Recipients(reply)...); contactErr != nil {

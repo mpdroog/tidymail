@@ -114,14 +114,14 @@ func TestParallelDownloadsStoreEverything(t *testing.T) {
 		}
 	})
 
-	res, err := New(cfg, st, log.New(testLog{t}, "", 0)).Sync(t.Context())
+	res, err := New("", cfg, st, log.New(testLog{t}, "", 0)).Sync(t.Context())
 	if err != nil {
 		t.Fatalf("sync: %v", err)
 	}
 	if res.Fetched != 7 || res.New != 7 {
 		t.Errorf("fetched %d (%d new), want all 7", res.Fetched, res.New)
 	}
-	cursor, err := st.LoadCursor()
+	cursor, err := st.LoadCursor("")
 	if err != nil {
 		t.Fatalf("load cursor: %v", err)
 	}
@@ -150,12 +150,12 @@ func TestInterruptedSyncResumesFromLastBatch(t *testing.T) {
 	// First run: Ctrl+C right after the first message is stored.
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	first := New(cfg, st, log.New(cancelOnStore{cancel}, "", 0))
+	first := New("", cfg, st, log.New(cancelOnStore{cancel}, "", 0))
 	first.Verbose = true // cancelOnStore watches for the per-message line
 	if _, syncErr := first.Sync(ctx); syncErr == nil {
 		t.Fatal("interrupted sync should report an error")
 	}
-	cursor, err := st.LoadCursor()
+	cursor, err := st.LoadCursor("")
 	if err != nil {
 		t.Fatalf("load cursor: %v", err)
 	}
@@ -165,11 +165,74 @@ func TestInterruptedSyncResumesFromLastBatch(t *testing.T) {
 
 	// Second run picks up after that batch instead of starting over. Its log
 	// (batch statistics) is visible with go test -v.
-	res, err := New(cfg, st, log.New(testLog{t}, "", 0)).Sync(t.Context())
+	res, err := New("", cfg, st, log.New(testLog{t}, "", 0)).Sync(t.Context())
 	if err != nil {
 		t.Fatalf("resumed sync: %v", err)
 	}
 	if res.Fetched != 2 {
 		t.Errorf("resumed sync fetched %d, want the 2 messages not yet stored", res.Fetched)
+	}
+}
+
+func TestAccountsSyncIntoOneStore(t *testing.T) {
+	account := func(port int) config.IMAP {
+		return config.IMAP{
+			Host: "127.0.0.1", Port: port, TLS: config.TLSNone,
+			Username: "me@example.com", Password: "secret",
+			Inbox: "INBOX", Sent: "Sent", AfterFetch: config.AfterFetchKeep,
+			MaxFetch: 10, Connections: 1,
+		}
+	}
+	st, err := store.Open(t.Context(), t.TempDir(), log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := st.Close(); closeErr != nil {
+			t.Errorf("close store: %v", closeErr)
+		}
+	})
+
+	home, err := New("home", account(testServer(t, 2)), st, log.New(testLog{t}, "", 0)).Sync(t.Context())
+	if err != nil {
+		t.Fatalf("sync home: %v", err)
+	}
+	// The work server holds the same two messages byte for byte, plus one
+	// more: identical mail is stored once, under the account that got it first.
+	work, err := New("work", account(testServer(t, 3)), st, log.New(testLog{t}, "", 0)).Sync(t.Context())
+	if err != nil {
+		t.Fatalf("sync work: %v", err)
+	}
+	if home.New != 2 || work.Fetched != 3 || work.New != 1 {
+		t.Errorf("home new %d; work fetched %d, new %d; want 2; 3, 1", home.New, work.Fetched, work.New)
+	}
+
+	for account, want := range map[string]uint32{"home": 2, "work": 3} {
+		cursor, loadErr := st.LoadCursor(account)
+		if loadErr != nil {
+			t.Fatalf("load %s cursor: %v", account, loadErr)
+		}
+		if cursor.InboxUID != want {
+			t.Errorf("%s cursor = UID %d, want %d", account, cursor.InboxUID, want)
+		}
+	}
+
+	items, _, err := st.List(t.Context(), store.Query{Text: "mail", Limit: 10})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	accounts := make(map[string]string, len(items))
+	for _, it := range items {
+		m, getErr := st.Get(it.ID)
+		if getErr != nil {
+			t.Fatalf("get %s: %v", it.ID, getErr)
+		}
+		accounts[m.Mail.Subject] = m.Account
+	}
+	want := map[string]string{"mail 1": "home", "mail 2": "home", "mail 3": "work"}
+	for subject, account := range want {
+		if accounts[subject] != account {
+			t.Errorf("%q is filed under account %q, want %q", subject, accounts[subject], account)
+		}
 	}
 }

@@ -41,7 +41,10 @@ type Mail struct {
 // Message is a stored mail plus its mutable placement. It is exactly what a
 // state/<id>.json file contains.
 type Message struct {
-	ID      string `json:"id"`
+	ID string `json:"id"`
+	// Account is the name of the account the message was fetched through.
+	// Empty means the first account (mail stored before accounts had names).
+	Account string `json:"account,omitempty"`
 	Box     string `json:"box"`
 	PrevBox string `json:"prev_box,omitempty"`
 	// ServerBox is the box whose IMAP folder holds the server copy. When it
@@ -161,10 +164,10 @@ func (s *Store) Get(id string) (*Message, error) {
 	return s.readState(id)
 }
 
-// Ingest stores a raw message and files it into a box. It reports whether the
-// message was new; re-ingesting identical bytes is a no-op, which is what makes
-// a failed server-side archive safe to retry.
-func (s *Store) Ingest(ctx context.Context, raw []byte, received time.Time) (*Message, bool, error) {
+// Ingest stores a raw message fetched through account and files it into a
+// box. It reports whether the message was new; re-ingesting identical bytes is
+// a no-op, which is what makes a failed server-side archive safe to retry.
+func (s *Store) Ingest(ctx context.Context, account string, raw []byte, received time.Time) (*Message, bool, error) {
 	id := messageID(raw)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -203,8 +206,9 @@ func (s *Store) Ingest(ctx context.Context, raw []byte, received time.Time) (*Me
 	recipients := append(mailparse.AddressStrings(parsed.To), mailparse.AddressStrings(parsed.Cc)...)
 
 	m := &Message{
-		ID:  id,
-		Box: s.routeLocked(from.Address, recipients),
+		ID:      id,
+		Account: account,
+		Box:     s.routeLocked(from.Address, recipients),
 		// As fetched: the folder sync found it in. A rule filing it elsewhere
 		// makes serve move it there on the server too.
 		ServerBox: BoxUnprocessed,

@@ -91,7 +91,9 @@ func run() error {
 func runWithStore(cmd, dir string, verbose bool, logger *log.Logger) (err error) {
 	cfg, err := config.Load(dir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		// Only a missing config.toml calls for init; a missing secret file
+		// is also "not exist" but needs the file, not a new config.
+		if _, statErr := os.Stat(filepath.Join(dir, "config.toml")); errors.Is(statErr, os.ErrNotExist) {
 			return fmt.Errorf("%w\nrun 'tidymail -dir %s init' to create one", err, dir)
 		}
 		return err
@@ -118,9 +120,13 @@ func runWithStore(cmd, dir string, verbose bool, logger *log.Logger) (err error)
 		}
 	}()
 
-	syncer := imapsync.New(cfg.IMAP, st, logger)
-	syncer.Verbose = verbose
-	sender := smtpsend.New(cfg.SMTP)
+	accounts := make([]httpd.Account, 0, len(cfg.Accounts))
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		syncer := imapsync.New(a.Name, a.IMAP, st, accountLogger(logger, a.Name))
+		syncer.Verbose = verbose
+		accounts = append(accounts, httpd.Account{Name: a.Name, Syncer: syncer, Sender: smtpsend.New(a.SMTP), Mirror: a.IMAP.Mirror})
+	}
 
 	switch cmd {
 	case "reindex":
@@ -132,29 +138,63 @@ func runWithStore(cmd, dir string, verbose bool, logger *log.Logger) (err error)
 		return nil
 
 	case "sync":
-		res, err := syncer.Sync(ctx)
-		if err != nil {
-			return err
-		}
-		logger.Print("sync done: " + res.Summary())
-		if cfg.Notify {
-			notifyNewMail(st, res, logger)
-		}
-		return nil
+		return syncAll(ctx, cfg, st, accounts, logger)
 
 	case "serve":
-		return serve(ctx, cfg, st, syncer, sender, logger)
+		return serve(ctx, cfg, st, accounts, logger)
 
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
 }
 
+// accountLogger prefixes an account's log lines with its name, so interleaved
+// output from several accounts stays readable.
+func accountLogger(logger *log.Logger, name string) *log.Logger {
+	if name == "" {
+		return logger
+	}
+	return log.New(logger.Writer(), "["+name+"] ", logger.Flags()|log.Lmsgprefix)
+}
+
+// syncAll fetches every account in turn. A failing account is reported and
+// the others still sync; the error of every failed account is returned.
+func syncAll(ctx context.Context, cfg *config.Config, st *store.Store, accounts []httpd.Account, logger *log.Logger) error {
+	var (
+		errs     []error
+		newByBox = make(map[string]int)
+	)
+	for _, a := range accounts {
+		if ctx.Err() != nil {
+			errs = append(errs, fmt.Errorf("sync: %w", ctx.Err()))
+			break
+		}
+		res, err := a.Syncer.Sync(ctx)
+		for box, n := range res.NewByBox {
+			newByBox[box] += n
+		}
+		if err != nil {
+			if a.Name != "" {
+				err = fmt.Errorf("account %s: %w", a.Name, err)
+			}
+			logger.Printf("sync failed: %v", err)
+			errs = append(errs, err)
+			continue
+		}
+		accountLogger(logger, a.Name).Print("sync done: " + res.Summary())
+	}
+	if cfg.Notify {
+		notifyNewMail(st, newByBox, logger)
+	}
+	return errors.Join(errs...)
+}
+
 // serve runs the web server until the context is cancelled. It never fetches
-// mail: that is 'tidymail sync', so only one process ever does. The syncer
-// appends sent replies to the Sent folder and repeats box moves in IMAP folders.
-func serve(ctx context.Context, cfg *config.Config, st *store.Store, syncer *imapsync.Syncer, sender *smtpsend.Sender, logger *log.Logger) error {
-	srv, err := httpd.New(cfg, st, syncer, sender, logger)
+// mail: that is 'tidymail sync', so only one process ever does. Each account's
+// syncer appends sent replies to its Sent folder and repeats box moves in its
+// IMAP folders.
+func serve(ctx context.Context, cfg *config.Config, st *store.Store, accounts []httpd.Account, logger *log.Logger) error {
+	srv, err := httpd.New(cfg, st, accounts, logger)
 	if err != nil {
 		return err
 	}
@@ -182,11 +222,11 @@ func serve(ctx context.Context, cfg *config.Config, st *store.Store, syncer *ima
 }
 
 // notifyNewMail raises one desktop notification for new mail outside Spam.
-func notifyNewMail(st *store.Store, res imapsync.Result, logger *log.Logger) {
+func notifyNewMail(st *store.Store, newByBox map[string]int, logger *log.Logger) {
 	total := 0
 	var parts []string
 	for _, b := range st.Boxes() {
-		n := res.NewByBox[b.Slug]
+		n := newByBox[b.Slug]
 		if n == 0 || b.Slug == store.BoxSpam {
 			continue
 		}
@@ -237,10 +277,11 @@ func releaseDelayed(ctx context.Context, st *store.Store, logger *log.Logger) {
 // configTemplate is written by the init command.
 const configTemplate = `# tidymail configuration.
 #
-# Keep secrets out of this file if you sync mail.d with git: use
+# Keep secrets out of this file if you sync mail.d with git: point at a file
+# under secrets/, which mail.d/.gitignore excludes:
+#   password = "file:secrets/personal-imap.txt"
+# or read it from the environment:
 #   password = "env:TIDYMAIL_IMAP_PASSWORD"
-# or point at a file that git ignores:
-#   password = "file:secrets/imap.txt"
 #
 # 'tidymail serve' never fetches mail. Run 'tidymail sync' to fetch, by hand
 # or on a timer (cron, systemd).
@@ -248,12 +289,20 @@ const configTemplate = `# tidymail configuration.
 listen = "127.0.0.1:8080"
 notify = true               # desktop notification when sync stores new mail
 
-[imap]
+# One [[account]] per mailbox; all of them share one set of boxes and one UI.
+# name tags every message fetched through the account: 1-32 of a-z, 0-9, - and
+# _, and do not rename it once mail has been synced. Copy the whole block for
+# every further account.
+
+[[account]]
+name = "personal"
+
+[account.imap]
 host = "imap.example.com"
 port = 993
 tls = "implicit"            # implicit | starttls | none
 username = "you@example.com"
-password = "env:TIDYMAIL_IMAP_PASSWORD"
+password = "file:secrets/personal-imap.txt"
 inbox = "INBOX"
 sent = ""                   # empty: detect the \Sent folder
 archive = ""                # empty: detect the \Archive folder
@@ -263,13 +312,15 @@ after_fetch = "archive"     # archive | delete | keep
 scan_sent = true            # learn the whitelist from who you have written to
 max_fetch = 200
 connections = 3             # parallel downloads during sync (1-10)
+mirror = true               # repeat box moves in IMAP folders; false: never
+                            # move mail on the server, boxes stay local
 
-[smtp]
+[account.smtp]
 host = "smtp.example.com"
 port = 587
 tls = "starttls"            # starttls | implicit | none
 username = "you@example.com"
-password = "env:TIDYMAIL_SMTP_PASSWORD"
+password = "file:secrets/personal-smtp.txt"
 from_name = "Your Name"
 from_addr = "you@example.com"
 `

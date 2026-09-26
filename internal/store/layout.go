@@ -9,7 +9,7 @@
 //	  boxes.toml             box definitions
 //	  rules.toml             address -> box routing rules
 //	  contacts.txt           addresses we have written to (the whitelist)
-//	  sync.json              IMAP cursor state
+//	  sync.json              IMAP cursor state (sync-<account>.json per named account)
 //	  mail/YYYY/MM/<id>.eml  raw RFC 5322 message, immutable
 //	  mail/YYYY/MM/<id>.txt  extracted plain text, immutable
 //	  state/<ab>/<id>.json   which box a message is in, mutable
@@ -62,6 +62,8 @@ index.db
 index.db-wal
 index.db-shm
 tmp/
+# Passwords referenced as file:secrets/... in config.toml
+secrets/
 `
 
 // rel joins path elements into a slash-separated path relative to mail.d, the

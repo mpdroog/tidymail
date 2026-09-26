@@ -17,9 +17,9 @@ import (
 
 // schemaVersion is bumped whenever the index layout changes. The index is
 // derived data, so a mismatch simply rebuilds it from the state files.
-// schemaVersion 2 added server_box; a version change rebuilds the index from
-// the state files.
-const schemaVersion = 2
+// schemaVersion 2 added server_box, 3 added account; a version change
+// rebuilds the index from the state files.
+const schemaVersion = 3
 
 // index is the SQLite search index. It owns no truth: every row can be
 // reconstructed from mail.d/state.
@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS messages (
 	in_reply_to   TEXT NOT NULL DEFAULT '',
 	eml           TEXT NOT NULL DEFAULT '',
 	updated_unix  INTEGER NOT NULL DEFAULT 0,
-	server_box    TEXT NOT NULL DEFAULT ''
+	server_box    TEXT NOT NULL DEFAULT '',
+	account       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS messages_box_date ON messages (box, date_unix DESC);
 CREATE INDEX IF NOT EXISTS messages_from ON messages (from_addr);
@@ -170,14 +171,14 @@ func (i *index) Upsert(ctx context.Context, m *Message, body string) (err error)
 	if _, err = tx.ExecContext(ctx, `
 		INSERT INTO messages (id, box, prev_box, delayed_until, unread, from_name, from_addr,
 			to_addrs, cc_addrs, subject, date_unix, size, attachments, message_id, in_reply_to,
-			eml, updated_unix, server_box)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			eml, updated_unix, server_box, account)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			box=excluded.box, prev_box=excluded.prev_box, delayed_until=excluded.delayed_until,
 			unread=excluded.unread, updated_unix=excluded.updated_unix, server_box=excluded.server_box`,
 		m.ID, m.Box, m.PrevBox, delayed, unread, m.Mail.From.Name, m.Mail.From.Address,
 		to, cc, m.Mail.Subject, m.Mail.Date.Unix(), m.Mail.Size, len(m.Mail.Attachments),
-		m.Mail.MessageID, m.Mail.InReplyTo, m.Mail.EML, m.UpdatedAt.Unix(), m.ServerBox); err != nil {
+		m.Mail.MessageID, m.Mail.InReplyTo, m.Mail.EML, m.UpdatedAt.Unix(), m.ServerBox, m.Account); err != nil {
 		return fmt.Errorf("index message %s: %w", m.ID, err)
 	}
 

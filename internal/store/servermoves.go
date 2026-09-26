@@ -3,22 +3,25 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // PendingMove is a message whose IMAP folder no longer matches its box.
 type PendingMove struct {
 	ID        string
+	Account   string // account whose server holds the message
 	Box       string // where it should be
 	ServerBox string // where the server copy is
 	MessageID string
 }
 
-// PendingMoves returns up to limit messages that still have to be moved on the
-// IMAP server, oldest change first.
-func (s *Store) PendingMoves(ctx context.Context, limit int) ([]PendingMove, error) {
+// PendingMoves returns up to limit messages of the given accounts that still
+// have to be moved on the IMAP server, oldest change first. Asking per account
+// keeps one unreachable server from holding up the others.
+func (s *Store) PendingMoves(ctx context.Context, limit int, accounts ...string) ([]PendingMove, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.idx.PendingMoves(ctx, limit)
+	return s.idx.PendingMoves(ctx, limit, accounts)
 }
 
 // SetServerBox records that the server copy of a message is now in the folder
@@ -85,10 +88,27 @@ func (s *Store) moveIfIn(ctx context.Context, id, from, to string) (bool, error)
 	return true, s.setBoxLocked(ctx, id, to, "", 0)
 }
 
-// PendingMoves lists messages whose server_box lags behind box.
-func (i *index) PendingMoves(ctx context.Context, limit int) (out []PendingMove, err error) {
-	rows, err := i.db.QueryContext(ctx, `SELECT id, box, server_box, message_id FROM messages
-		WHERE server_box != '' AND server_box != box ORDER BY updated_unix LIMIT ?`, limit)
+// accountFilter returns an "account IN (...)" clause and its arguments.
+func accountFilter(accounts []string) (clause string, args []any) {
+	args = make([]any, 0, len(accounts))
+	for _, a := range accounts {
+		args = append(args, a)
+	}
+	return "account IN (" + strings.TrimSuffix(strings.Repeat("?,", len(accounts)), ",") + ")", args
+}
+
+// PendingMoves lists messages of the given accounts whose server_box lags
+// behind box.
+func (i *index) PendingMoves(ctx context.Context, limit int, accounts []string) (out []PendingMove, err error) {
+	if len(accounts) == 0 {
+		return nil, nil
+	}
+	clause, args := accountFilter(accounts)
+	args = append(args, limit)
+	// #nosec G202 -- only placeholders are concatenated; values are bound
+	rows, err := i.db.QueryContext(ctx, `SELECT id, account, box, server_box, message_id FROM messages
+		WHERE server_box != '' AND server_box != box AND `+clause+`
+		ORDER BY updated_unix LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query pending moves: %w", err)
 	}
@@ -99,7 +119,7 @@ func (i *index) PendingMoves(ctx context.Context, limit int) (out []PendingMove,
 	}()
 	for rows.Next() {
 		var p PendingMove
-		if err = rows.Scan(&p.ID, &p.Box, &p.ServerBox, &p.MessageID); err != nil {
+		if err = rows.Scan(&p.ID, &p.Account, &p.Box, &p.ServerBox, &p.MessageID); err != nil {
 			return nil, fmt.Errorf("scan pending move: %w", err)
 		}
 		out = append(out, p)
@@ -110,10 +130,16 @@ func (i *index) PendingMoves(ctx context.Context, limit int) (out []PendingMove,
 	return out, nil
 }
 
-// CountPendingMoves returns how many messages still have to move on the server.
-func (i *index) CountPendingMoves(ctx context.Context) (int, error) {
+// CountPendingMoves returns how many messages of the given accounts still have
+// to move on the server.
+func (i *index) CountPendingMoves(ctx context.Context, accounts []string) (int, error) {
+	if len(accounts) == 0 {
+		return 0, nil
+	}
+	clause, args := accountFilter(accounts)
 	var n int
-	if err := i.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE server_box != '' AND server_box != box`).Scan(&n); err != nil {
+	// #nosec G202 -- only placeholders are concatenated; values are bound
+	if err := i.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE server_box != '' AND server_box != box AND `+clause, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count pending moves: %w", err)
 	}
 	return n, nil

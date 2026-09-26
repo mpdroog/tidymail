@@ -32,8 +32,8 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 	})
 
 	cfg := &config.Config{Listen: "127.0.0.1:0"}
-	cfg.SMTP.FromAddr = "me@example.com"
-	srv, err := New(cfg, st, nil, nil, logger)
+	cfg.Accounts = []config.Account{{SMTP: config.SMTP{FromAddr: "me@example.com"}}}
+	srv, err := New(cfg, st, nil, logger)
 	if err != nil {
 		t.Fatalf("httpd.New: %v", err)
 	}
@@ -45,7 +45,7 @@ func seed(t *testing.T, st *store.Store, from, subject, body string) *store.Mess
 	raw := []byte("From: " + from + "\r\nTo: me@example.com\r\nSubject: " + subject +
 		"\r\nDate: Mon, 31 Aug 2026 10:00:00 +0000\r\nMessage-ID: <" + subject + "@test>\r\n" +
 		"Content-Type: text/plain; charset=utf-8\r\n\r\n" + body + "\r\n")
-	m, _, err := st.Ingest(t.Context(), raw, time.Now())
+	m, _, err := st.Ingest(t.Context(), "", raw, time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestAttachmentIsServedAsInertDownload(t *testing.T) {
 		"--b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n" +
 		"--b\r\nContent-Type: text/html\r\nContent-Disposition: attachment; filename=\"evil.html\"\r\n\r\n" +
 		"<script>alert(1)</script>\r\n--b--\r\n")
-	m, _, err := st.Ingest(t.Context(), raw, time.Now())
+	m, _, err := st.Ingest(t.Context(), "", raw, time.Now())
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestArchiveAllEmptiesUnprocessed(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	pending, err := st.PendingMoves(t.Context(), 10)
+	pending, err := st.PendingMoves(t.Context(), 10, "")
 	if err != nil {
 		t.Fatalf("PendingMoves: %v", err)
 	}
@@ -359,5 +359,75 @@ func TestHiddenPanelsStayHidden(t *testing.T) {
 	}
 	if !hasOverride {
 		t.Error("app.css is missing the [hidden] display override")
+	}
+}
+
+func TestMessageShowsItsAccountsReplyAddress(t *testing.T) {
+	srv, st := newTestServer(t)
+	srv.cfg.Accounts = append(srv.cfg.Accounts, config.Account{Name: "work", SMTP: config.SMTP{FromAddr: "me@work.example"}})
+	raw := []byte("From: bob@example.com\r\nTo: me@work.example\r\nSubject: for work\r\n" +
+		"Date: Mon, 31 Aug 2026 10:00:00 +0000\r\nMessage-ID: <work@test>\r\n\r\nbody\r\n")
+	m, _, err := st.Ingest(t.Context(), "work", raw, time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	rec := do(t, srv, http.MethodGet, "/api/messages/"+m.ID, "", false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET message = %d: %s", rec.Code, rec.Body.String())
+	}
+	var view struct {
+		Account   string `json:"account"`
+		ReplyFrom string `json:"reply_from"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Account != "work" || view.ReplyFrom != "me@work.example" {
+		t.Errorf("account %q, reply_from %q; want work, me@work.example", view.Account, view.ReplyFrom)
+	}
+}
+
+func TestReplyThroughUnconfiguredAccountIsRefused(t *testing.T) {
+	srv, st := newTestServer(t)
+	raw := []byte("From: bob@example.com\r\nTo: me@old.example\r\nSubject: old account\r\n" +
+		"Date: Mon, 31 Aug 2026 10:00:00 +0000\r\nMessage-ID: <old@test>\r\n\r\nbody\r\n")
+	m, _, err := st.Ingest(t.Context(), "removed", raw, time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	rec := do(t, srv, http.MethodPost, "/api/messages/"+m.ID+"/reply", `{"body":"hi"}`, true)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "not configured") {
+		t.Fatalf("reply = %d %s, want 409 naming the missing account", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUnmirroredAccountNeverTouchesTheServer(t *testing.T) {
+	srv, st := newTestServer(t)
+	// No syncer: reaching the server for this account would panic.
+	srv.accounts = []Account{{Mirror: false}}
+	m := seed(t, st, "ann@example.com", "local only", "body")
+	if _, err := st.SetBox(t.Context(), m.ID, store.BoxPriority); err != nil {
+		t.Fatalf("SetBox: %v", err)
+	}
+
+	srv.mirrorPending(t.Context())
+
+	got, err := st.Get(m.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.ServerBox != store.BoxUnprocessed {
+		t.Errorf("server box = %q, want it left where sync found it", got.ServerBox)
+	}
+	rec := do(t, srv, http.MethodGet, "/api/state", "", false)
+	var state struct {
+		Stats store.Stats `json:"stats"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if state.Stats.PendingIMAP != 0 {
+		t.Errorf("pending = %d, want 0: an unmirrored account has nothing to move", state.Stats.PendingIMAP)
 	}
 }

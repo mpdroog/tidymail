@@ -187,33 +187,49 @@ type Cursor struct {
 	LastSync    time.Time `json:"last_sync"`
 }
 
-// LoadCursor reads sync.json, returning a zero value when it does not exist yet.
-func (s *Store) LoadCursor() (Cursor, error) {
+// cursorFile is the sync position file of an account: sync.json for the
+// unnamed single account, sync-<name>.json for named ones.
+func cursorFile(account string) string {
+	if account == "" {
+		return syncFile
+	}
+	return "sync-" + account + ".json"
+}
+
+// LoadCursor reads an account's sync position, returning a zero value when it
+// does not exist yet.
+func (s *Store) LoadCursor(account string) (Cursor, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.loadCursorLocked(account)
+}
+
+func (s *Store) loadCursorLocked(account string) (Cursor, error) {
 	var st Cursor
-	raw, err := s.root.ReadFile(syncFile)
+	name := cursorFile(account)
+	raw, err := s.root.ReadFile(name)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return st, nil
 		}
-		return st, fmt.Errorf("read %s: %w", s.abs(syncFile), err)
+		return st, fmt.Errorf("read %s: %w", s.abs(name), err)
 	}
 	if err := json.Unmarshal(raw, &st); err != nil {
-		return st, fmt.Errorf("parse %s: %w", s.abs(syncFile), err)
+		return st, fmt.Errorf("parse %s: %w", s.abs(name), err)
 	}
 	return st, nil
 }
 
-// SaveCursor persists the IMAP sync position.
-func (s *Store) SaveCursor(st Cursor) error {
+// SaveCursor persists an account's IMAP sync position.
+func (s *Store) SaveCursor(account string, st Cursor) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	name := cursorFile(account)
 	raw, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode %s: %w", syncFile, err)
+		return fmt.Errorf("encode %s: %w", name, err)
 	}
-	return s.writeFileAtomic(syncFile, append(raw, '\n'))
+	return s.writeFileAtomic(name, append(raw, '\n'))
 }
 
 // SaveOutbox records a message we sent, so replies are part of the git-synced
@@ -240,20 +256,28 @@ type Stats struct {
 	PendingIMAP int       `json:"pending_imap"` // box moves not yet made on the server
 }
 
-// Stats returns a summary of what the store holds.
-func (s *Store) Stats(ctx context.Context) (Stats, error) {
-	st, err := s.LoadCursor()
-	if err != nil {
-		return Stats{}, err
-	}
+// Stats returns a summary of what the store holds. LastSync is the most recent
+// sync of any of accounts; PendingIMAP counts only the mirrored accounts,
+// since the others never move mail on the server.
+func (s *Store) Stats(ctx context.Context, accounts, mirrored []string) (Stats, error) {
 	contacts := s.Contacts()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	var lastSync time.Time
+	for _, account := range accounts {
+		st, err := s.loadCursorLocked(account)
+		if err != nil {
+			return Stats{}, err
+		}
+		if st.LastSync.After(lastSync) {
+			lastSync = st.LastSync
+		}
+	}
 	ids, err := s.idx.AllIDs(ctx)
 	if err != nil {
 		return Stats{}, err
 	}
-	pending, err := s.idx.CountPendingMoves(ctx)
+	pending, err := s.idx.CountPendingMoves(ctx, mirrored)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -262,7 +286,7 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 		Boxes:       len(s.boxes),
 		Rules:       len(s.rules),
 		Contacts:    len(contacts),
-		LastSync:    st.LastSync,
+		LastSync:    lastSync,
 		Dir:         s.dir,
 		PendingIMAP: pending,
 	}, nil

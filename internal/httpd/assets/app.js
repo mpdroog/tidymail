@@ -461,7 +461,8 @@ function openCompose() {
     toast("This message has no address to reply to.", "error");
     return;
   }
-  el("compose-to").textContent = `Re: ${to}${state.fromAddr ? `  (from ${state.fromAddr})` : ""}`;
+  const from = msg.reply_from || state.fromAddr;
+  el("compose-to").textContent = `Re: ${to}${from ? `  (from ${from})` : ""}`;
   el("compose").hidden = false;
   el("compose-body").focus();
   el("compose").scrollIntoView({ block: "nearest" });

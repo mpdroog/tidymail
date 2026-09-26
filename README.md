@@ -20,9 +20,9 @@ gets one box, and every message in a box has four ways out: **reply**,
 ```sh
 make build
 ./tidymail init                       # writes mail.d/config.toml
-$EDITOR mail.d/config.toml            # fill in your account
-export TIDYMAIL_IMAP_PASSWORD=...     # if you used env: in the config
-export TIDYMAIL_SMTP_PASSWORD=...
+$EDITOR mail.d/config.toml            # fill in your account(s)
+mkdir -p mail.d/secrets               # passwords, one file each (gitignored)
+$EDITOR mail.d/secrets/personal-imap.txt
 ./tidymail sync                       # fetch mail, then exit
 ./tidymail serve                      # http://127.0.0.1:8080
 ```
@@ -36,6 +36,36 @@ Other commands:
 
 `-dir` points at a different `mail.d` if you keep more than one. `sync` logs
 one statistics line per batch; add `-v` to also log every stored message.
+
+## Multiple accounts
+
+One `mail.d` can hold any number of mailboxes, all in the same boxes and the
+same UI. Give each its own `[[account]]` table with a `name`:
+
+```toml
+[[account]]
+name = "personal"
+[account.imap]
+host = "imap.mail.me.com"
+# ...
+[account.smtp]
+host = "smtp.mail.me.com"
+# ...
+
+[[account]]
+name = "work"
+[account.imap]
+# ...
+```
+
+Every account starts from the defaults, so each table only needs what differs.
+`sync` fetches the accounts one after the other; one that fails is reported and
+the others still sync. A message remembers the account it came in on: replies
+go out through that account's SMTP server and `from_addr`, and box moves are
+made in that account's IMAP folders. The name is stored with every message, so
+do not rename an account once it has synced.
+
+The single-account form, a plain `[imap]` and `[smtp]`, still works.
 
 ## Fetching mail
 
@@ -123,7 +153,8 @@ mail.d/
   boxes.toml             box definitions
   rules.toml             address -> box routing
   contacts.txt           the whitelist, one address per line
-  sync.json              IMAP cursor (UIDVALIDITY, last UID seen)
+  sync-<account>.json    IMAP cursor per account (UIDVALIDITY, last UID seen)
+  secrets/               password files (gitignored)
   mail/2026/08/<id>.eml  the raw message, never modified
   mail/2026/08/<id>.txt  its extracted plain text
   state/ab/<id>.json     which box it is in, and until when
@@ -140,8 +171,9 @@ at a time. `index.db` is in `.gitignore` because it is derived — on a second
 machine tidymail notices an empty index and rebuilds it from the text files.
 
 **Secrets:** if you are going to commit `mail.d`, do not put passwords in
-`config.toml`. Use `password = "env:TIDYMAIL_IMAP_PASSWORD"` or
-`password = "file:secrets/imap.txt"` with that file ignored.
+`config.toml`. Use `password = "file:secrets/personal-imap.txt"` (the
+`secrets/` directory is in `mail.d/.gitignore`) or
+`password = "env:TIDYMAIL_IMAP_PASSWORD"`.
 
 ## What tidymail does to your IMAP account
 
@@ -156,6 +188,11 @@ sees the same sorting:
 | Spam | `imap.junk`, the `\Junk` folder, or `Spam` |
 | Trash | `imap.trash`, the `\Trash` folder, or `Trash` |
 | any other box | a folder named after the box, created when needed |
+
+Set `mirror = false` under an account's `[imap]` to turn this off: boxes then
+exist on your machine only and tidymail never moves that account's mail on the
+server. Together with `after_fetch = "keep"` the server is left exactly as it
+was, apart from replies being appended to Sent.
 
 Messages are found on the server by Message-ID. Every move counts: `m`, Ignore,
 Delete, rules applied to existing mail, Archive all, delayed mail coming back.

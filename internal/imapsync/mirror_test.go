@@ -17,7 +17,7 @@ func TestMirrorMovesFollowBoxes(t *testing.T) {
 		Inbox: "INBOX", Sent: "Sent", AfterFetch: config.AfterFetchKeep,
 		MaxFetch: 10, Connections: 1,
 	}
-	s := New(cfg, nil, log.New(testLog{t}, "", 0))
+	s := New("", cfg, nil, log.New(testLog{t}, "", 0))
 	names := map[string]string{store.BoxPriority: "Priority"}
 
 	count := func(mailbox string) uint32 {

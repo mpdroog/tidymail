@@ -30,11 +30,15 @@ type Syncer struct {
 
 	// Verbose also logs every stored message, not only batch statistics.
 	Verbose bool
+
+	// retryWait is the pause before a failed batch download is retried on a
+	// fresh connection; it grows with each attempt.
+	retryWait time.Duration
 }
 
 // New returns a Syncer.
 func New(cfg config.IMAP, st *store.Store, logger *log.Logger) *Syncer {
-	return &Syncer{cfg: cfg, st: st, log: logger}
+	return &Syncer{cfg: cfg, st: st, log: logger, retryWait: 2 * time.Second}
 }
 
 // Result summarises one sync run.
@@ -293,6 +297,14 @@ func (s *Syncer) fetchInbox(ctx context.Context, c *imapclient.Client, f folders
 	if len(uids) == 0 {
 		return nil
 	}
+	if s.cfg.AfterFetch != config.AfterFetchKeep {
+		if uids, err = s.clearStored(ctx, c, f, cursor.InboxUID, uids, res); err != nil {
+			return err
+		}
+		if len(uids) == 0 {
+			return nil
+		}
+	}
 
 	section := &imap.FetchItemBodySection{Peek: true}
 	opts := &imap.FetchOptions{
@@ -394,6 +406,81 @@ func (s *Syncer) fetchInbox(ctx context.Context, c *imapclient.Client, f folders
 	}
 	completed = true
 	return nil
+}
+
+// envelopeChunk is how many envelopes clearStored fetches at once.
+const envelopeChunk = 1000
+
+// clearStored archives or deletes INBOX messages that an earlier run already
+// stored, without downloading them again, and returns the UIDs still to fetch.
+//
+// A message at or below the cursor was downloaded before, but can still be in
+// INBOX: after_fetch used to be "keep", the run stopped between storing and
+// cleaning up, or it could not be stored. Its Message-ID tells those apart;
+// anything not found in the store, or without a Message-ID, is fetched again.
+func (s *Syncer) clearStored(ctx context.Context, c *imapclient.Client, f folders, cursorUID uint32, uids []imap.UID, res *Result) ([]imap.UID, error) {
+	var seen, rest []imap.UID
+	for _, uid := range uids {
+		if uint32(uid) <= cursorUID {
+			seen = append(seen, uid)
+		} else {
+			rest = append(rest, uid)
+		}
+	}
+	if len(seen) == 0 {
+		return uids, nil
+	}
+
+	start := time.Now()
+	var again []imap.UID
+	cleared := 0
+	for _, chunk := range batchUIDs(seen, envelopeChunk) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("clear stored mail: %w", ctxErr)
+		}
+		msgs, err := c.Fetch(imap.UIDSetNum(chunk...), &imap.FetchOptions{UID: true, Envelope: true}).Collect()
+		if err != nil {
+			return nil, fmt.Errorf("imap fetch envelopes from %s: %w", f.inbox, err)
+		}
+		mids := make(map[imap.UID]string, len(msgs))
+		var lookup []string
+		for _, m := range msgs {
+			if m.Envelope == nil {
+				continue
+			}
+			if mid := strings.Trim(strings.TrimSpace(m.Envelope.MessageID), "<>"); mid != "" {
+				mids[m.UID] = mid
+				lookup = append(lookup, mid)
+			}
+		}
+		stored, err := s.st.StoredMessageIDs(ctx, lookup)
+		if err != nil {
+			return nil, err
+		}
+
+		var done imap.UIDSet
+		for _, uid := range chunk {
+			if mid, ok := mids[uid]; ok && stored[mid] {
+				done.AddNum(uid)
+			} else {
+				again = append(again, uid)
+			}
+		}
+		if len(done) == 0 {
+			continue
+		}
+		archived, deleted, err := s.cleanup(c, done, f.archive)
+		if err != nil {
+			return nil, err
+		}
+		res.Archived += archived
+		res.Deleted += deleted
+		res.Remaining -= archived + deleted
+		cleared += archived + deleted
+	}
+	s.log.Printf("sync: %d message(s) in %s were already stored, cleared without downloading in %s; %d to fetch again",
+		cleared, f.inbox, round(time.Since(start)), len(again))
+	return append(again, rest...), nil
 }
 
 // cleanup applies the configured after_fetch action to messages that are now

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -426,5 +427,155 @@ func TestHTMLOnlyBodyBecomesText(t *testing.T) {
 	}
 	if !strings.Contains(body, "<https://example.com>") {
 		t.Errorf("body = %q, want the link target preserved", body)
+	}
+}
+
+func TestMoveEverythingFromSender(t *testing.T) {
+	ctx := t.Context()
+	s := testStore(t)
+	var first *Message
+	for _, subj := range []string{"one", "two", "three"} {
+		m, _, err := s.Ingest(ctx, rawMail("news@shop.example", "me@example.com", subj, "body"), time.Now())
+		if err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		if first == nil {
+			first = m
+		}
+	}
+	other, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "keep me", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	// Mail from the same sender in another box stays where it is.
+	elsewhere, _, err := s.Ingest(ctx, rawMail("news@shop.example", "me@example.com", "filed", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if _, err = s.SetBox(ctx, elsewhere.ID, BoxPriority); err != nil {
+		t.Fatalf("SetBox: %v", err)
+	}
+
+	sender, from, ids, err := s.SenderIDs(ctx, first.ID)
+	if err != nil || sender != "news@shop.example" || from != BoxUnprocessed {
+		t.Fatalf("SenderIDs = %q in %q, %v", sender, from, err)
+	}
+	var lastDone int
+	moved, err := s.MoveEach(ctx, ids, from, BoxTrash, func(done, _ int) { lastDone = done })
+	if err != nil {
+		t.Fatalf("MoveEach: %v", err)
+	}
+	if moved != 3 || lastDone != 3 {
+		t.Errorf("moved %d, progress reached %d; want 3 and 3", moved, lastDone)
+	}
+	items, total, err := s.List(ctx, Query{From: "news@shop.example", Box: BoxUnprocessed})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if total != 0 {
+		t.Errorf("%d message(s) from the sender left in Unprocessed, want 0: %+v", total, items)
+	}
+	if got, getErr := s.Get(elsewhere.ID); getErr != nil || got.Box != BoxPriority {
+		t.Errorf("mail in another box was moved too (box %v, err %v)", got, getErr)
+	}
+	if got, getErr := s.Get(other.ID); getErr != nil || got.Box == BoxTrash {
+		t.Errorf("another sender's message was flushed too (box %v, err %v)", got, getErr)
+	}
+
+	// Moving adds no rule: new mail from the sender still arrives normally.
+	next, _, err := s.Ingest(ctx, rawMail("news@shop.example", "me@example.com", "four", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if next.Box == BoxTrash || next.Box == BoxSpam {
+		t.Errorf("mail after the move went to %q", next.Box)
+	}
+}
+
+func TestReceivedCountIgnoresMovesAndTrashRules(t *testing.T) {
+	ctx := t.Context()
+	s := testStore(t)
+	count := func() int {
+		t.Helper()
+		n, err := s.ReceivedCount(ctx)
+		if err != nil {
+			t.Fatalf("ReceivedCount: %v", err)
+		}
+		return n
+	}
+	a, _, err := s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "one", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if _, _, err = s.Ingest(ctx, rawMail("ann@example.com", "me@example.com", "two", "body"), time.Now()); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if got := count(); got != 2 {
+		t.Fatalf("after two arrivals = %d, want 2", got)
+	}
+	// Trashing mail yourself is a move, not an arrival or a departure.
+	if _, err = s.SetBox(ctx, a.ID, BoxTrash); err != nil {
+		t.Fatalf("SetBox: %v", err)
+	}
+	if got := count(); got != 2 {
+		t.Errorf("after trashing one = %d, want still 2", got)
+	}
+	// Mail a rule files straight into Trash is not news.
+	if err = s.AddRule(Rule{Field: MatchFrom, Address: "junk@example.com", Box: BoxTrash}); err != nil {
+		t.Fatalf("AddRule: %v", err)
+	}
+	if _, _, err = s.Ingest(ctx, rawMail("junk@example.com", "me@example.com", "junk", "body"), time.Now()); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if got := count(); got != 2 {
+		t.Errorf("after mail ruled into Trash = %d, want still 2", got)
+	}
+}
+
+func TestBodyMatchesInOneBox(t *testing.T) {
+	ctx := t.Context()
+	s := testStore(t)
+	ingest := func(subject, body string) *Message {
+		t.Helper()
+		m, _, err := s.Ingest(ctx, rawMail("ops@example.com", "me@example.com", subject, body), time.Now())
+		if err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		return m
+	}
+	ingest("a", "Backup of host web1 FAILED at night")
+	ingest("b", "backup of host web2 failed too")
+	ingest("c", "all good, backup_ok")
+	filed := ingest("d", "backup of host db1 failed")
+	if _, err := s.SetBox(ctx, filed.ID, BoxPriority); err != nil {
+		t.Fatalf("SetBox: %v", err)
+	}
+
+	items, total, err := s.BodyMatches(ctx, BoxUnprocessed, "host % failed", 50)
+	if err != nil {
+		t.Fatalf("BodyMatches: %v", err)
+	}
+	if total != 2 || len(items) != 2 {
+		t.Fatalf("matched %d (%d listed), want the 2 failures in Unprocessed, not the one in Priority", total, len(items))
+	}
+	for _, it := range items {
+		if !strings.Contains(strings.ToLower(it.Snippet), "failed") {
+			t.Errorf("snippet %q does not show the match", it.Snippet)
+		}
+	}
+
+	// _ is a literal, not LIKE's any-character wildcard.
+	ids, err := s.BodyMatchIDs(ctx, BoxUnprocessed, "backup_ok")
+	if err != nil || len(ids) != 1 {
+		t.Errorf("backup_ok matched %d, %v; want 1", len(ids), err)
+	}
+	if ids, err = s.BodyMatchIDs(ctx, BoxUnprocessed, "backup_of"); err != nil || len(ids) != 0 {
+		t.Errorf("backup_of matched %d, %v; want 0 (the _ must not match a space)", len(ids), err)
+	}
+
+	for _, loose := range []string{"%", " % % ", "ab", "%a%b%"} {
+		if _, err := s.BodyMatchIDs(ctx, BoxUnprocessed, loose); !errors.Is(err, ErrBadPattern) {
+			t.Errorf("pattern %q: err = %v, want ErrBadPattern", loose, err)
+		}
 	}
 }

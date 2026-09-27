@@ -87,31 +87,78 @@ func (s *Syncer) startDownloads(ctx context.Context, mailbox string, batches [][
 	}()
 
 	for _, c := range clients {
-		// IMAP commands take no context: closing the connection is what
-		// interrupts a fetch in flight.
-		stop := context.AfterFunc(ctx, func() { s.closeConn(c) })
 		d.wg.Add(1)
 		go func() {
 			defer d.wg.Done()
-			defer func() {
-				if stop() {
-					if err := logoutClient(c); err != nil {
-						s.log.Printf("imap: fetch connection: %v", err)
-					}
-				}
-			}()
-			for i := range jobs {
-				start := time.Now()
-				msgs, err := c.Fetch(imap.UIDSetNum(batches[i]...), opts).Collect()
-				if err != nil {
-					err = fmt.Errorf("imap fetch from %s: %w", mailbox, err)
-					d.fail(err)
-				}
-				d.results[i] <- fetched{msgs: msgs, download: time.Since(start), err: err}
-			}
+			s.fetchWorker(ctx, d, c, mailbox, batches, jobs, opts)
 		}()
 	}
 	return d, nil
+}
+
+// fetchAttempts is how often one batch is tried before the sync gives up.
+const fetchAttempts = 4
+
+// fetchWorker downloads the batches handed to it on jobs. Servers drop
+// connections during a long sync, so a failed batch is retried on a fresh
+// connection before the whole sync is given up.
+func (s *Syncer) fetchWorker(ctx context.Context, d *downloader, c *imapclient.Client, mailbox string,
+	batches [][]imap.UID, jobs <-chan int, opts *imap.FetchOptions) {
+	// IMAP commands take no context: closing the connection is what
+	// interrupts a fetch in flight.
+	var stop func() bool
+	watch := func() {
+		cc := c
+		stop = context.AfterFunc(ctx, func() { s.closeConn(cc) })
+	}
+	drop := func() {
+		if stop() {
+			s.closeConn(c)
+		}
+		c = nil
+	}
+	watch()
+	defer func() {
+		if c != nil && stop() {
+			if err := logoutClient(c); err != nil {
+				s.log.Printf("imap: fetch connection: %v", err)
+			}
+		}
+	}()
+
+	for i := range jobs {
+		start := time.Now()
+		var msgs []*imapclient.FetchMessageBuffer
+		var err error
+		for attempt := 1; ; attempt++ {
+			if c == nil {
+				if c, err = s.openFetcher(mailbox); err == nil {
+					watch()
+				}
+			}
+			if c != nil {
+				if msgs, err = c.Fetch(imap.UIDSetNum(batches[i]...), opts).Collect(); err == nil {
+					break
+				}
+				err = fmt.Errorf("imap fetch from %s: %w", mailbox, err)
+				drop() // a failed fetch leaves the connection in an unknown state
+			}
+			if attempt == fetchAttempts || ctx.Err() != nil {
+				break
+			}
+			wait := time.Duration(attempt) * s.retryWait
+			s.log.Printf("sync: batch %d/%d failed (%v), retrying on a new connection in %s (attempt %d/%d)",
+				i+1, len(batches), err, wait, attempt+1, fetchAttempts)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+			}
+		}
+		if err != nil {
+			d.fail(err)
+		}
+		d.results[i] <- fetched{msgs: msgs, download: time.Since(start), err: err}
+	}
 }
 
 // next waits for batch i, which must be asked for in order.

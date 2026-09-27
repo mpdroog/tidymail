@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/mpdroog/tidymail/internal/config"
 	"github.com/mpdroog/tidymail/internal/store"
+	"github.com/mpdroog/tidymail/internal/summarize"
 )
 
 // newTestServer builds a Server backed by a temporary store. The IMAP and SMTP
@@ -359,5 +362,177 @@ func TestHiddenPanelsStayHidden(t *testing.T) {
 	}
 	if !hasOverride {
 		t.Error("app.css is missing the [hidden] display override")
+	}
+}
+
+func TestMoveSenderInBackground(t *testing.T) {
+	srv, st := newTestServer(t)
+	m := seed(t, st, "news@shop.example", "sale", "buy now")
+	seed(t, st, "news@shop.example", "more sale", "buy more")
+	filed := seed(t, st, "news@shop.example", "old sale", "bought")
+	seed(t, st, "ann@example.com", "lunch", "sandwich plans")
+	if _, err := st.SetBox(t.Context(), filed.ID, store.BoxPriority); err != nil {
+		t.Fatalf("SetBox: %v", err)
+	}
+
+	var preview senderPreview
+	decode(t, do(t, srv, http.MethodGet, "/api/messages/"+m.ID+"/sender", "", false), &preview)
+	if preview.Address != "news@shop.example" || preview.Box != store.BoxUnprocessed || preview.Total != 2 || len(preview.Items) != 2 {
+		t.Fatalf("preview = %+v, want the 2 messages from news@ in Unprocessed", preview)
+	}
+
+	var job jobView
+	decode(t, do(t, srv, http.MethodPost, "/api/messages/"+m.ID+"/move-sender", `{"box":"spam","rule":true}`, true), &job)
+	if job.Total != 2 {
+		t.Errorf("job total %d, want the 2 from news@ in Unprocessed", job.Total)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var list []jobView
+		decode(t, do(t, srv, http.MethodGet, "/api/jobs", "", false), &list)
+		if len(list) != 1 {
+			t.Fatalf("jobs = %+v, want the one just started", list)
+		}
+		if list[0].Finished {
+			if list[0].Error != "" || list[0].Moved != 2 || list[0].Done != 2 {
+				t.Fatalf("finished job = %+v, want 2 moved without error", list[0])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job never finished: %+v", list[0])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var boxList listView
+	decode(t, do(t, srv, http.MethodGet, "/api/messages?box=spam", "", false), &boxList)
+	if boxList.Total != 2 {
+		t.Errorf("Spam holds %d, want the 2 from Unprocessed", boxList.Total)
+	}
+	if got, err := st.Get(filed.ID); err != nil || got.Box != store.BoxPriority {
+		t.Errorf("mail in another box was moved too (box %v, err %v)", got, err)
+	}
+	// The rule files later mail from the sender there too.
+	if next := seed(t, st, "news@shop.example", "new sale", "again"); next.Box != store.BoxSpam {
+		t.Errorf("later mail went to %q, want spam", next.Box)
+	}
+}
+
+func TestMarkBoxSeenInBackground(t *testing.T) {
+	srv, st := newTestServer(t)
+	for _, subj := range []string{"one", "two", "three"} {
+		seed(t, st, "ann@example.com", subj, "body")
+	}
+
+	var job jobView
+	decode(t, do(t, srv, http.MethodPost, "/api/boxes/unprocessed/mark-seen", "{}", true), &job)
+	if job.Kind != "seen" || job.Total != 3 {
+		t.Fatalf("job = %+v, want a seen job over 3 messages", job)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var list []jobView
+		decode(t, do(t, srv, http.MethodGet, "/api/jobs", "", false), &list)
+		if len(list) == 1 && list[0].Finished {
+			if list[0].Error != "" || list[0].Moved != 3 {
+				t.Fatalf("finished job = %+v, want 3 marked", list[0])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job never finished: %+v", list)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var boxes []boxView
+	decode(t, do(t, srv, http.MethodGet, "/api/boxes", "", false), &boxes)
+	for _, b := range boxes {
+		if b.Slug == store.BoxUnprocessed && b.Unread != 0 {
+			t.Errorf("Unprocessed still has %d unread", b.Unread)
+		}
+	}
+}
+
+func TestTrashBodyMatchesInBackground(t *testing.T) {
+	srv, st := newTestServer(t)
+	seed(t, st, "ops@example.com", "one", "disk full on web1")
+	seed(t, st, "ops@example.com", "two", "Disk FULL on web2")
+	seed(t, st, "ops@example.com", "three", "all fine")
+
+	var preview bodyMatchView
+	decode(t, do(t, srv, http.MethodGet, "/api/boxes/unprocessed/body-matches?body=disk%20full", "", false), &preview)
+	if preview.Total != 2 {
+		t.Fatalf("preview = %+v, want 2 matches", preview)
+	}
+	if rec := do(t, srv, http.MethodGet, "/api/boxes/unprocessed/body-matches?body=%25", "", false); rec.Code != http.StatusBadRequest {
+		t.Errorf("a bare %% pattern answered %d, want 400", rec.Code)
+	}
+
+	var job jobView
+	decode(t, do(t, srv, http.MethodPost, "/api/boxes/unprocessed/trash-body-matches", `{"body":"disk full"}`, true), &job)
+	if job.Kind != "filter" || job.Total != 2 {
+		t.Fatalf("job = %+v, want a filter job over 2 messages", job)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var list []jobView
+		decode(t, do(t, srv, http.MethodGet, "/api/jobs", "", false), &list)
+		if len(list) == 1 && list[0].Finished {
+			if list[0].Error != "" || list[0].Moved != 2 {
+				t.Fatalf("finished job = %+v, want 2 moved", list[0])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job never finished: %+v", list)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var left listView
+	decode(t, do(t, srv, http.MethodGet, "/api/messages?box=unprocessed", "", false), &left)
+	if left.Total != 1 || left.Items[0].Subject != "three" {
+		t.Errorf("Unprocessed = %+v, want only the message that did not match", left.Items)
+	}
+}
+
+func TestSummaryIsMadeOnceAndShownWithTheMessage(t *testing.T) {
+	srv, st := newTestServer(t)
+	m := seed(t, st, "ann@example.com", "invoice", "please pay invoice 42")
+
+	// A stand-in claude that counts its runs.
+	dir := t.TempDir()
+	cmd := filepath.Join(dir, "claude")
+	script := "#!/bin/sh\ncat > /dev/null\necho run >> " + filepath.Join(dir, "runs") +
+		"\necho '{\"is_error\":false,\"structured_output\":{\"tldr\":\"Pay invoice 42.\",\"details\":\"More.\"}}'\n"
+	if err := os.WriteFile(cmd, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	sum, err := summarize.New(cmd, "", log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("summarize.New: %v", err)
+	}
+	srv.summarizer = sum
+
+	for range 2 {
+		var got store.Summary
+		decode(t, do(t, srv, http.MethodPost, "/api/messages/"+m.ID+"/summary", "{}", true), &got)
+		if got.TLDR != "Pay invoice 42." || got.Details != "More." {
+			t.Fatalf("summary = %+v", got)
+		}
+	}
+	runs, err := os.ReadFile(filepath.Join(dir, "runs"))
+	if err != nil {
+		t.Fatalf("read runs: %v", err)
+	}
+	if n := strings.Count(string(runs), "run"); n != 1 {
+		t.Errorf("claude ran %d times, want once: the second press must use the stored summary", n)
+	}
+
+	var view messageView
+	decode(t, do(t, srv, http.MethodGet, "/api/messages/"+m.ID, "", false), &view)
+	if view.Summary == nil || view.Summary.TLDR != "Pay invoice 42." {
+		t.Errorf("opened message has summary %+v, want the stored one", view.Summary)
 	}
 }

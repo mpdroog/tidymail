@@ -63,12 +63,23 @@ type SMTP struct {
 	FromAddr string  `toml:"from_addr"`
 }
 
+// Summary configures AI summaries, made by running the Claude Code CLI so
+// they use its login (a Claude subscription) rather than an API key.
+type Summary struct {
+	// Command is the claude binary; empty finds it on PATH or in
+	// ~/.local/bin, where its installer puts it.
+	Command string `toml:"command"`
+	// Model is passed as --model when set; empty uses the CLI's default.
+	Model string `toml:"model"`
+}
+
 // Config is the fully resolved runtime configuration.
 type Config struct {
-	Listen string `toml:"listen"`
-	Notify bool   `toml:"notify"` // desktop notification when sync stores new mail
-	IMAP   IMAP   `toml:"imap"`
-	SMTP   SMTP   `toml:"smtp"`
+	Listen  string  `toml:"listen"`
+	Notify  bool    `toml:"notify"` // desktop notification when sync stores new mail
+	IMAP    IMAP    `toml:"imap"`
+	SMTP    SMTP    `toml:"smtp"`
+	Summary Summary `toml:"summary"`
 
 	// Dir is the mail.d directory this config was loaded from. It is not
 	// part of the file itself.

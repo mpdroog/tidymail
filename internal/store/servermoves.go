@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // PendingMove is a message whose IMAP folder no longer matches its box.
@@ -117,4 +118,36 @@ func (i *index) CountPendingMoves(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("count pending moves: %w", err)
 	}
 	return n, nil
+}
+
+// StoredMessageIDs reports which of the given Message-IDs (without angle
+// brackets) belong to a message already in the store.
+func (s *Store) StoredMessageIDs(ctx context.Context, ids []string) (map[string]bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.idx.StoredMessageIDs(ctx, ids)
+}
+
+// messageIDChunk keeps each IN (...) well under SQLite's variable limit.
+const messageIDChunk = 500
+
+func (i *index) StoredMessageIDs(ctx context.Context, ids []string) (map[string]bool, error) {
+	found := make(map[string]bool, len(ids))
+	for start := 0; start < len(ids); start += messageIDChunk {
+		chunk := ids[start:min(start+messageIDChunk, len(ids))]
+		args := make([]any, len(chunk))
+		for j, id := range chunk {
+			args[j] = id
+		}
+		query := `SELECT DISTINCT message_id FROM messages WHERE message_id IN (?` +
+			strings.Repeat(",?", len(chunk)-1) + `)`
+		stored, err := i.queryIDs(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("look up message ids: %w", err)
+		}
+		for _, id := range stored {
+			found[id] = true
+		}
+	}
+	return found, nil
 }

@@ -3,12 +3,14 @@ package imapsync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
@@ -30,8 +32,15 @@ func testServer(t *testing.T, n int) int {
 // folders afterwards. Message i has Message-ID <i@test>.
 func startTestServer(t *testing.T, n int) (int, *imapmemserver.User) {
 	t.Helper()
+	return startTestServerWith(t, n, nil)
+}
+
+// startTestServerWith is startTestServer with wrap, when set, applied to every
+// new session, to make the server misbehave.
+func startTestServerWith(t *testing.T, n int, wrap func(*imapserver.Conn, imapserver.Session) imapserver.Session) (int, *imapmemserver.User) {
+	t.Helper()
 	user := imapmemserver.NewUser("me@example.com", "secret")
-	for _, name := range []string{"INBOX", "Sent", "Trash"} {
+	for _, name := range []string{"INBOX", "Sent", "Trash", "Archive"} {
 		if err := user.Create(name, nil); err != nil {
 			t.Fatalf("create %s: %v", name, err)
 		}
@@ -47,7 +56,10 @@ func startTestServer(t *testing.T, n int) (int, *imapmemserver.User) {
 	mem.AddUser(user)
 
 	srv := imapserver.New(&imapserver.Options{
-		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			if wrap != nil {
+				return wrap(conn, mem.NewSession()), nil, nil
+			}
 			return mem.NewSession(), nil, nil
 		},
 		Caps:         imap.CapSet{imap.CapIMAP4rev1: {}},
@@ -171,5 +183,129 @@ func TestInterruptedSyncResumesFromLastBatch(t *testing.T) {
 	}
 	if res.Fetched != 2 {
 		t.Errorf("resumed sync fetched %d, want the 2 messages not yet stored", res.Fetched)
+	}
+}
+
+// testStore opens a store in a temporary directory.
+func testStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(t.Context(), t.TempDir(), log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := st.Close(); closeErr != nil {
+			t.Errorf("close store: %v", closeErr)
+		}
+	})
+	return st
+}
+
+// folderCount returns how many messages a folder on the test server holds.
+func folderCount(t *testing.T, user *imapmemserver.User, mailbox string) uint32 {
+	t.Helper()
+	st, err := user.Status(mailbox, &imap.StatusOptions{NumMessages: true})
+	if err != nil {
+		t.Fatalf("status %s: %v", mailbox, err)
+	}
+	return *st.NumMessages
+}
+
+func TestArchiveClearsStoredMailWithoutDownloading(t *testing.T) {
+	port, user := startTestServer(t, 5)
+	cfg := config.IMAP{
+		Host: "127.0.0.1", Port: port, TLS: config.TLSNone,
+		Username: "me@example.com", Password: "secret",
+		Inbox: "INBOX", Sent: "Sent", Archive: "Archive", AfterFetch: config.AfterFetchKeep,
+		MaxFetch: 2, Connections: 2,
+	}
+	st := testStore(t)
+	if _, err := New(cfg, st, log.New(testLog{t}, "", 0)).Sync(t.Context()); err != nil {
+		t.Fatalf("keep sync: %v", err)
+	}
+
+	// Switching keep -> archive must not download the same mail again.
+	cfg.AfterFetch = config.AfterFetchArchive
+	res, err := New(cfg, st, log.New(testLog{t}, "", 0)).Sync(t.Context())
+	if err != nil {
+		t.Fatalf("archive sync: %v", err)
+	}
+	if res.Fetched != 0 || res.Bytes != 0 {
+		t.Errorf("fetched %d message(s), %d bytes; want nothing downloaded", res.Fetched, res.Bytes)
+	}
+	if res.Archived != 5 || res.Remaining != 0 {
+		t.Errorf("archived %d, %d left; want 5 archived, 0 left", res.Archived, res.Remaining)
+	}
+	if in, arch := folderCount(t, user, "INBOX"), folderCount(t, user, "Archive"); in != 0 || arch != 5 {
+		t.Errorf("INBOX %d, Archive %d; want 0 and 5", in, arch)
+	}
+}
+
+func TestArchiveRefetchesMailMissingFromStore(t *testing.T) {
+	port, user := startTestServer(t, 3)
+	cfg := config.IMAP{
+		Host: "127.0.0.1", Port: port, TLS: config.TLSNone,
+		Username: "me@example.com", Password: "secret",
+		Inbox: "INBOX", Sent: "Sent", Archive: "Archive", AfterFetch: config.AfterFetchArchive,
+		MaxFetch: 2, Connections: 1,
+	}
+	st := testStore(t)
+	// The cursor claims all three were seen, but none is stored: a message
+	// that failed to store must be fetched again, never archived unread.
+	if err := st.SaveCursor(store.Cursor{InboxUID: 3}); err != nil {
+		t.Fatalf("save cursor: %v", err)
+	}
+	res, err := New(cfg, st, log.New(testLog{t}, "", 0)).Sync(t.Context())
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if res.New != 3 || res.Archived != 3 {
+		t.Errorf("%d new, %d archived; want 3 and 3", res.New, res.Archived)
+	}
+	if in := folderCount(t, user, "INBOX"); in != 0 {
+		t.Errorf("INBOX holds %d, want 0", in)
+	}
+}
+
+// dropFirstBodyFetch closes the connection of the first session that asks for
+// message bodies, as a server dropping a connection mid-sync would.
+type dropFirstBodyFetch struct {
+	imapserver.Session
+	conn    *imapserver.Conn
+	dropped *atomic.Bool
+}
+
+func (s dropFirstBodyFetch) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+	if len(options.BodySection) > 0 && s.dropped.CompareAndSwap(false, true) {
+		if err := s.conn.NetConn().Close(); err != nil {
+			return err
+		}
+		return errors.New("connection dropped")
+	}
+	return s.Session.Fetch(w, numSet, options)
+}
+
+func TestDroppedFetchConnectionIsRetried(t *testing.T) {
+	var dropped atomic.Bool
+	port, _ := startTestServerWith(t, 6, func(conn *imapserver.Conn, sess imapserver.Session) imapserver.Session {
+		return dropFirstBodyFetch{Session: sess, conn: conn, dropped: &dropped}
+	})
+	cfg := config.IMAP{
+		Host: "127.0.0.1", Port: port, TLS: config.TLSNone,
+		Username: "me@example.com", Password: "secret",
+		Inbox: "INBOX", Sent: "Sent", AfterFetch: config.AfterFetchKeep,
+		MaxFetch: 2, Connections: 2,
+	}
+	s := New(cfg, testStore(t), log.New(testLog{t}, "", 0))
+	s.retryWait = 0
+	res, err := s.Sync(t.Context())
+	if err != nil {
+		t.Fatalf("sync should survive one dropped connection: %v", err)
+	}
+	if !dropped.Load() {
+		t.Fatal("the test server never dropped a connection")
+	}
+	if res.New != 6 {
+		t.Errorf("stored %d new, want all 6", res.New)
 	}
 }

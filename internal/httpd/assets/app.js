@@ -11,9 +11,11 @@ const state = {
   csrf: "",
   boxes: [],
   fromAddr: "",
+  summaries: false, // whether the server can make AI summaries
   box: "unprocessed",
   query: "",
-  unreadOnly: false,
+  jobs: new Map(), // background moves by id, as last reported
+  seenTotal: -1, // messages across all boxes when the list was last loaded
   offset: 0,
   limit: 50,
   total: 0,
@@ -120,8 +122,23 @@ async function loadState() {
   state.csrf = data.csrf;
   state.boxes = data.boxes;
   state.fromAddr = data.from_addr;
+  state.summaries = data.summaries;
   renderBoxes();
   renderStats(data.stats);
+}
+
+// unreadIn is a box's unread count as the UI shows it: mail in Trash is never
+// news, so Trash has none.
+function unreadIn(box) {
+  return box.slug === "trash" ? 0 : box.unread;
+}
+
+// updateListActions shows the whole-box buttons that apply to the box in view.
+function updateListActions() {
+  el("archive-all").hidden = !(state.box === "unprocessed" && !state.query && state.total > 0);
+  const box = state.boxes.find((b) => b.slug === state.box);
+  el("mark-seen").hidden = !(box && !state.query && unreadIn(box) > 0);
+  el("filter-body").hidden = !(!state.query && state.box !== "trash" && state.total > 0);
 }
 
 function renderBoxes() {
@@ -135,7 +152,8 @@ function renderBoxes() {
     button.className = "box";
     button.setAttribute("aria-current", String(box.slug === state.box));
     button.append(span("box-name", box.name));
-    const count = span(box.unread > 0 ? "count unread" : "count", box.unread > 0 ? `${box.unread}/${box.total}` : String(box.total));
+    const unread = unreadIn(box);
+    const count = span(unread > 0 ? "count unread" : "count", unread > 0 ? `${unread}/${box.total}` : String(box.total));
     button.append(count);
     button.addEventListener("click", () => selectBox(box.slug));
     li.append(button);
@@ -154,6 +172,7 @@ function renderBoxes() {
     }
     list.append(li);
   }
+  updateListActions();
 }
 
 function renderStats(stats) {
@@ -182,7 +201,6 @@ async function loadList(keepSelection = false) {
     limit: String(state.limit),
     offset: String(state.offset),
   });
-  if (state.unreadOnly) params.set("unread", "1");
 
   const data = await api(`/api/messages?${params.toString()}`);
   state.items = data.items;
@@ -203,7 +221,7 @@ function renderList() {
     const li = document.createElement("li");
     li.tabIndex = 0;
     li.setAttribute("aria-selected", String(i === state.selected));
-    if (item.unread) li.classList.add("unread");
+    if (item.unread && item.box !== "trash") li.classList.add("unread");
 
     const top = document.createElement("div");
     top.className = "row-top";
@@ -240,7 +258,7 @@ function renderList() {
   el("page-info").textContent = `page ${page} of ${pages}`;
   el("prev-page").disabled = state.offset === 0;
   el("next-page").disabled = state.offset + state.limit >= state.total;
-  el("archive-all").hidden = !(state.box === "unprocessed" && !state.query && state.total > 0);
+  updateListActions();
 }
 
 function openIndex(i) {
@@ -302,9 +320,63 @@ function renderMessage(msg) {
     atts.append(li);
   }
 
+  renderSummary(msg);
   el("msg-raw").href = `/api/messages/${msg.id}/raw`;
   el("msg-body").textContent = msg.body || "(this message has no text body)";
   el("read-pane").scrollTop = 0;
+}
+
+/* ---------- summaries ---------------------------------------------------- */
+
+// renderSummary shows the stored summary of msg, or the button to make one.
+function renderSummary(msg) {
+  const sum = msg.summary;
+  el("summary").hidden = !sum;
+  el("summarize").hidden = !!sum || !state.summaries;
+  el("summarize").disabled = false;
+  el("summarize").textContent = "Summarize ";
+  el("summarize").append(kbd("s"));
+  if (!sum) return;
+  el("summary-tldr").textContent = sum.tldr;
+  el("summary-details").textContent = sum.details;
+  el("summary-details").hidden = true;
+  el("summary-more").hidden = !sum.details;
+  el("summary-more").textContent = "Explain more";
+}
+
+function kbd(text) {
+  const k = document.createElement("kbd");
+  k.textContent = text;
+  return k;
+}
+
+function toggleSummaryDetails() {
+  const details = el("summary-details");
+  details.hidden = !details.hidden;
+  el("summary-more").textContent = details.hidden ? "Explain more" : "Less";
+}
+
+// summarize asks for a summary of the open message. It takes a few seconds;
+// if the reader has moved on by then, it is kept for when they come back.
+async function summarize() {
+  const msg = state.message;
+  if (!msg || !state.summaries) return;
+  if (msg.summary) {
+    toggleSummaryDetails();
+    return;
+  }
+  const button = el("summarize");
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = "Summarizing…";
+  try {
+    const sum = await api(`/api/messages/${msg.id}/summary`, { method: "POST", body: {} });
+    msg.summary = sum;
+    if (state.message && state.message.id === msg.id) renderSummary(msg);
+  } catch (err) {
+    if (state.message && state.message.id === msg.id) renderSummary(msg);
+    report(err);
+  }
 }
 
 /* ---------- actions ------------------------------------------------------ */
@@ -313,6 +385,28 @@ async function refreshBoxes() {
   const boxes = await api("/api/boxes");
   state.boxes = boxes;
   renderBoxes();
+}
+
+/* ---------- new mail ----------------------------------------------------- */
+
+// /api/received only grows when 'tidymail sync' stores mail outside Trash;
+// moves never change it. A higher count than when the page last loaded means
+// it is out of date. Taken before the list loads, so nothing slips between.
+async function markSeen() {
+  const received = await api("/api/received");
+  state.seenTotal = received.count;
+  el("new-mail").hidden = true;
+}
+
+async function checkNewMail() {
+  if (document.hidden || state.seenTotal < 0) return;
+  const received = await api("/api/received");
+  const arrived = received.count - state.seenTotal;
+  const banner = el("new-mail");
+  if (arrived > 0) {
+    banner.textContent = `${arrived} new message(s) arrived. Refresh (g)`;
+    banner.hidden = false;
+  }
 }
 
 // afterAction drops the message from the current view and moves on, which is
@@ -377,11 +471,166 @@ async function actionMove(box) {
   await afterAction(res, `Moved to ${boxName(box)}.`);
 }
 
-async function actionDelete() {
+// moveOnlyThis moves the open message and, when address is set, adds a rule
+// so later mail from that sender lands in the same box.
+async function moveOnlyThis(box, address) {
+  if (address) {
+    await api("/api/rules", { method: "POST", body: { match: "from", address, box, apply_existing: false } });
+    toast(`Later mail from ${address} goes to ${boxName(box)} too.`);
+  }
+  await actionMove(box);
+}
+
+async function actionRemove() {
   const id = currentID();
   if (!id) return;
   const res = await api(`/api/messages/${id}/delete`, { method: "POST", body: {} });
   await afterAction(res, "Moved to Trash.");
+}
+
+// senderList renders the preview of a sender's mail: how many, and the newest.
+function senderList(preview, body) {
+  const p = document.createElement("p");
+  p.textContent = preview.total > preview.items.length
+    ? `${preview.total} message(s) from this sender in ${boxName(preview.box)}, the newest ${preview.items.length} below.`
+    : `${preview.total} message(s) from this sender in ${boxName(preview.box)}:`;
+  body.append(p);
+
+  const list = document.createElement("ul");
+  list.className = "sender-list";
+  for (const item of preview.items) {
+    const li = document.createElement("li");
+    li.append(span("sender-date", humanDate(item.date)));
+    li.append(span("sender-subject", item.subject || "(no subject)"));
+    list.append(li);
+  }
+  body.append(list);
+}
+
+// askRemove trashes the open message. When the sender has more mail in the
+// same box it offers to take all of it, showing what that would be first.
+async function askRemove() {
+  const id = currentID();
+  if (!id) return;
+  if (state.message.box === "trash") return;
+  const preview = await api(`/api/messages/${id}/sender`);
+  if (preview.total <= 1) {
+    await actionRemove();
+    return;
+  }
+  openModal(`Remove mail from ${preview.address}?`, (body, done) => {
+    senderList(preview, body);
+    const note = document.createElement("p");
+    note.textContent = "They also move to Trash on your IMAP account. Later mail from this sender still arrives.";
+    body.append(note);
+
+    const choices = document.createElement("div");
+    choices.className = "choices";
+    const all = document.createElement("button");
+    all.type = "button";
+    all.className = "danger";
+    all.textContent = `Move ${preview.total} to Trash`;
+    all.addEventListener("click", () => {
+      done();
+      startSenderMove("trash", false).catch(report);
+    });
+    const one = document.createElement("button");
+    one.type = "button";
+    one.textContent = "Only this email";
+    one.addEventListener("click", () => {
+      done();
+      actionRemove().catch(report);
+    });
+    choices.append(all, one);
+    body.append(choices);
+  });
+}
+
+// startSenderMove moves everything from the open message's sender to box in
+// the background; the jobs panel shows how far it is.
+async function startSenderMove(box, rule) {
+  const id = currentID();
+  if (!id) return;
+  const job = await api(`/api/messages/${id}/move-sender`, { method: "POST", body: { box, rule } });
+  if (rule) toast(`Later mail from ${job.address} goes to ${boxName(box)} too.`);
+  state.jobs.set(job.id, job);
+  renderJobs();
+  pollJobs();
+}
+
+async function markBoxSeen(box) {
+  const job = await api(`/api/boxes/${box}/mark-seen`, { method: "POST", body: {} });
+  el("mark-seen").hidden = true;
+  state.jobs.set(job.id, job);
+  renderJobs();
+  pollJobs();
+}
+
+/* ---------- background jobs ---------------------------------------------- */
+
+function jobLabel(job) {
+  switch (job.kind) {
+    case "seen": return `${boxName(job.box)}: marking all seen`;
+    case "filter": return `${boxName(job.box)}: “${job.pattern}” → Trash`;
+    default: return `${job.address} → ${boxName(job.box)}`;
+  }
+}
+
+function jobDone(job) {
+  switch (job.kind) {
+    case "seen": return `Marked ${job.moved} message(s) in ${boxName(job.box)} as seen.`;
+    case "filter": return `Moved ${job.moved} message(s) matching “${job.pattern}” to Trash.`;
+    default: return `Moved ${job.moved} message(s) from ${job.address} to ${boxName(job.box)}.`;
+  }
+}
+
+function renderJobs() {
+  const panel = el("jobs");
+  clear(panel);
+  for (const job of state.jobs.values()) {
+    if (job.finished) continue;
+    const row = document.createElement("div");
+    row.className = "job";
+    const head = document.createElement("div");
+    head.className = "job-head";
+    head.append(span("job-label", jobLabel(job)));
+    head.append(span("job-count", `${job.done} / ${job.total}`));
+    row.append(head);
+    const bar = document.createElement("progress");
+    bar.max = Math.max(job.total, 1);
+    bar.value = job.done;
+    row.append(bar);
+    panel.append(row);
+  }
+  panel.hidden = panel.childElementCount === 0;
+}
+
+// pollJobs follows running jobs until they are all done, then reloads the
+// view once per finished job. It also picks up jobs started before a reload.
+let jobTimer = 0;
+async function pollJobs() {
+  window.clearTimeout(jobTimer);
+  const list = await api("/api/jobs");
+  let movedNow = false;
+  let seenNow = false;
+  for (const job of list) {
+    const before = state.jobs.get(job.id);
+    if (job.finished && before && !before.finished) {
+      if (job.kind === "seen") seenNow = true;
+      else movedNow = true;
+      if (job.error) toast(`Stopped after ${job.moved} message(s): ${job.error}`, "error");
+      else toast(jobDone(job));
+    }
+    if (before || !job.finished) state.jobs.set(job.id, job);
+  }
+  renderJobs();
+  // A move took the open message away, so go on to the next like any action;
+  // marking seen changes nothing in view but the styling.
+  if (movedNow) await afterAction(null, "");
+  else if (seenNow) await Promise.all([loadList(true), refreshBoxes()]);
+  if ([...state.jobs.values()].some((j) => !j.finished)) {
+    jobTimer = window.setTimeout(() => { pollJobs().catch(report); }, 500);
+  }
 }
 
 function confirmArchiveAll() {
@@ -528,41 +777,43 @@ function askDelay() {
   });
 }
 
-function askMove() {
-  if (!currentID()) return;
-  openModal("Move to which box?", (body, done) => {
+async function askMove() {
+  const id = currentID();
+  if (!id) return;
+  const current = state.message.box;
+  const preview = await api(`/api/messages/${id}/sender`);
+  openModal(`Move mail from ${preview.address}`, (body, done) => {
+    senderList(preview, body);
+
+    const checkbox = (label) => {
+      const wrap = document.createElement("label");
+      wrap.className = "check";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      wrap.append(input, document.createTextNode(` ${label}`));
+      body.append(wrap);
+      return input;
+    };
+    const only = checkbox("Only this email");
+    const rule = checkbox(`Always move email from ${preview.address} to the chosen folder`);
+    rule.checked = true;
+
     const choices = document.createElement("div");
     choices.className = "choices";
     for (const box of state.boxes) {
-      if (box.slug === state.message.box) continue;
       const b = document.createElement("button");
       b.type = "button";
       b.textContent = box.name;
+      // Moving to the box the mail is already in would do nothing.
+      b.disabled = box.slug === current;
       b.addEventListener("click", () => {
         done();
-        actionMove(box.slug).catch(report);
+        if (only.checked) moveOnlyThis(box.slug, rule.checked ? preview.address : "").catch(report);
+        else startSenderMove(box.slug, rule.checked).catch(report);
       });
       choices.append(b);
     }
     body.append(choices);
-
-    const note = document.createElement("p");
-    note.textContent = "Always send mail from this sender here?";
-    body.append(note);
-
-    const ruleRow = document.createElement("div");
-    ruleRow.className = "choices";
-    for (const box of state.boxes.filter((b) => !b.system || b.slug === "spam")) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = `Rule → ${box.name}`;
-      b.addEventListener("click", () => {
-        done();
-        addRuleForSender(box.slug).catch(report);
-      });
-      ruleRow.append(b);
-    }
-    body.append(ruleRow);
   });
 }
 
@@ -598,16 +849,6 @@ function askIgnore() {
   });
 }
 
-async function addRuleForSender(box) {
-  const msg = state.message;
-  if (!msg) return;
-  const res = await api("/api/rules", {
-    method: "POST",
-    body: { match: "from", address: msg.mail.from.address, box, apply_existing: true },
-  });
-  await afterAction(res, `Mail from ${msg.mail.from.address} now goes to ${boxName(box)} (${res.moved || 0} moved).`);
-}
-
 function confirmDeleteBox(box) {
   openModal(`Delete the ${box.name} box?`, (body, done) => {
     const p = document.createElement("p");
@@ -632,11 +873,149 @@ function confirmDeleteBox(box) {
   });
 }
 
+/* ---------- body filter -------------------------------------------------- */
+
+// filterDelay is how long typing must pause before the preview is fetched.
+const filterDelay = 600;
+const filterMinChars = 3;
+
+// askBodyFilter trashes every message in box whose text contains a pattern.
+// The preview follows the pattern as it is typed, so what the button does is
+// always on screen before it is pressed.
+function askBodyFilter(box) {
+  openModal(`Remove by text in ${boxName(box)}`, (body, done) => {
+    const hint = document.createElement("p");
+    hint.textContent = "Trashes every message here whose text contains this, ignoring case. % matches anything in between, e.g. backup % failed.";
+    body.append(hint);
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "filter-input";
+    input.placeholder = "%text in the body%";
+    input.autocomplete = "off";
+    body.append(input);
+
+    const summary = document.createElement("p");
+    summary.className = "filter-summary";
+    const list = document.createElement("ul");
+    list.className = "sender-list match-list";
+    list.hidden = true;
+    const go = document.createElement("button");
+    go.type = "button";
+    go.className = "danger";
+    go.disabled = true;
+    go.textContent = "Move to Trash";
+    body.append(summary, list, go);
+
+    let pattern = "";
+    let asked = 0; // only the answer to the latest request is shown
+    const show = async () => {
+      const typed = input.value.trim();
+      const chars = typed.replace(/[%\s]/g, "").length;
+      go.disabled = true;
+      clear(list);
+      list.hidden = true;
+      if (chars < filterMinChars) {
+        summary.textContent = typed ? `Type at least ${filterMinChars} characters.` : "";
+        return;
+      }
+      const mine = ++asked;
+      summary.textContent = "Searching…";
+      let res;
+      try {
+        res = await api(`/api/boxes/${box}/body-matches?${new URLSearchParams({ body: typed })}`);
+      } catch (err) {
+        if (mine === asked) summary.textContent = err.message;
+        return;
+      }
+      if (mine !== asked) return;
+      pattern = typed;
+      summary.textContent = res.total > res.items.length
+        ? `${res.total} message(s) match, the newest ${res.items.length} below.`
+        : `${res.total} message(s) match.`;
+      for (const item of res.items) {
+        const li = document.createElement("li");
+        li.append(span("sender-date", humanDate(item.date)));
+        li.append(span("sender-subject", `${displayName(item)}: ${item.subject || "(no subject)"}`));
+        li.append(span("match-snippet", item.snippet));
+        list.append(li);
+      }
+      list.hidden = res.total === 0;
+      go.textContent = `Move ${res.total} to Trash`;
+      go.disabled = res.total === 0;
+    };
+    const later = debounce(() => { show().catch(report); }, filterDelay);
+    input.addEventListener("input", () => {
+      ++asked; // a pending answer is for an older pattern now
+      go.disabled = true;
+      later();
+    });
+
+    go.addEventListener("click", () => {
+      done();
+      trashBodyMatches(box, pattern).catch(report);
+    });
+  });
+}
+
+async function trashBodyMatches(box, pattern) {
+  const job = await api(`/api/boxes/${box}/trash-body-matches`, { method: "POST", body: { body: pattern } });
+  state.jobs.set(job.id, job);
+  renderJobs();
+  pollJobs();
+}
+
+/* ---------- rules -------------------------------------------------------- */
+
+// showRules lists every routing rule with a Remove button each. Removing a
+// rule only changes where later mail lands; nothing already filed moves.
+async function showRules() {
+  const rules = await api("/api/rules");
+  rules.sort((a, b) => boxName(a.box).localeCompare(boxName(b.box)) || a.address.localeCompare(b.address));
+  openModal(`Rules (${rules.length})`, (body) => {
+    const p = document.createElement("p");
+    p.textContent = rules.length === 0
+      ? "No rules yet. Move (m) with \"Always move email from …\" ticked creates one, and so does Ignore (i)."
+      : "Incoming mail from these senders goes straight to their box. Removing a rule leaves mail already filed where it is.";
+    body.append(p);
+    if (rules.length === 0) return;
+
+    const list = document.createElement("ul");
+    list.className = "sender-list rule-list";
+    for (const rule of rules) {
+      const li = document.createElement("li");
+      const who = rule.match === "from" ? rule.address : `${rule.match}: ${rule.address}`;
+      li.append(span("sender-subject", who));
+      li.append(span("tag", boxName(rule.box)));
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ghost small";
+      b.textContent = "Remove";
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          await api("/api/rules/delete", { method: "POST", body: { match: rule.match, address: rule.address } });
+          toast(`Rule removed: ${rule.address} no longer goes to ${boxName(rule.box)}.`);
+          await loadState();
+          await showRules();
+        } catch (err) {
+          b.disabled = false;
+          report(err);
+        }
+      });
+      li.append(b);
+      list.append(li);
+    }
+    body.append(list);
+  });
+}
+
 /* ---------- refresh------------------------------------------------------ */
 
 // refresh re-reads mail.d. Fetching is 'tidymail sync', a separate process;
 // this only picks up what it stored.
 async function refresh() {
+  await markSeen();
   await Promise.all([loadState(), loadList(true)]);
   toast("Refreshed.");
 }
@@ -690,16 +1069,20 @@ function onKey(ev) {
       break;
     case "m":
       ev.preventDefault();
-      askMove();
+      askMove().catch(report);
       break;
-    case "#":
+    case "x":
     case "Delete":
       ev.preventDefault();
-      actionDelete().catch(report);
+      askRemove().catch(report);
       break;
     case "g":
       ev.preventDefault();
       refresh().catch(report);
+      break;
+    case "s":
+      ev.preventDefault();
+      summarize().catch(report);
       break;
     case "/":
       ev.preventDefault();
@@ -723,18 +1106,16 @@ function debounce(fn, ms) {
 function wire() {
   el("refresh").addEventListener("click", () => refresh().catch(report));
   el("archive-all").addEventListener("click", confirmArchiveAll);
+  el("filter-body").addEventListener("click", () => askBodyFilter(state.box));
+  el("summary-more").addEventListener("click", toggleSummaryDetails);
+  el("show-rules").addEventListener("click", () => { showRules().catch(report); });
+  el("mark-seen").addEventListener("click", () => { markBoxSeen(state.box).catch(report); });
 
   el("search").addEventListener("input", debounce((ev) => {
     state.query = ev.target.value.trim();
     state.offset = 0;
     loadList().catch(report);
   }, 200));
-
-  el("unread-only").addEventListener("change", (ev) => {
-    state.unreadOnly = ev.target.checked;
-    state.offset = 0;
-    loadList().catch(report);
-  });
 
   el("prev-page").addEventListener("click", () => {
     state.offset = Math.max(0, state.offset - state.limit);
@@ -767,8 +1148,9 @@ function wire() {
         case "ignore": askIgnore(); break;
         case "prio": actionPrio().catch(report); break;
         case "delay": askDelay(); break;
-        case "move": askMove(); break;
-        case "delete": actionDelete().catch(report); break;
+        case "move": askMove().catch(report); break;
+        case "remove": askRemove().catch(report); break;
+        case "summarize": summarize().catch(report); break;
         default: break;
       }
     });
@@ -781,13 +1163,19 @@ function wire() {
     if (ev.target === el("modal")) closeModal();
   });
   document.addEventListener("keydown", onKey);
+
+  el("new-mail").addEventListener("click", () => { refresh().catch(report); });
+  window.setInterval(() => { checkNewMail().catch(report); }, 30 * 1000);
+  document.addEventListener("visibilitychange", () => { checkNewMail().catch(report); });
 }
 
 async function main() {
   wire();
   try {
     await loadState();
+    await markSeen();
     await loadList();
+    await pollJobs();
   } catch (err) {
     report(err);
   }

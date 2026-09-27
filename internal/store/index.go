@@ -210,6 +210,28 @@ func (i *index) IDsFromSender(ctx context.Context, addr string) ([]string, error
 	return i.queryIDs(ctx, `SELECT id FROM messages WHERE from_addr = ?`, addr)
 }
 
+// IDsFromSenderInBox returns every message id sent by an address that is in
+// box.
+func (i *index) IDsFromSenderInBox(ctx context.Context, addr, box string) ([]string, error) {
+	return i.queryIDs(ctx, `SELECT id FROM messages WHERE from_addr = ? AND box = ?`, addr, box)
+}
+
+// UnreadIDsInBox returns every unread message id in box.
+func (i *index) UnreadIDsInBox(ctx context.Context, box string) ([]string, error) {
+	return i.queryIDs(ctx, `SELECT id FROM messages WHERE box = ? AND unread = 1`, box)
+}
+
+// ReceivedCount counts messages that arrived anywhere but Trash. Moves never
+// change it, so it only grows when new mail is stored. Mail a rule filed
+// straight into Trash still has an empty prev_box and is left out.
+func (i *index) ReceivedCount(ctx context.Context) (int, error) {
+	var n int
+	if err := i.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE NOT (box = ? AND prev_box = '')`, BoxTrash).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count received mail: %w", err)
+	}
+	return n, nil
+}
+
 // AllIDs returns every indexed message id.
 func (i *index) AllIDs(ctx context.Context) ([]string, error) {
 	return i.queryIDs(ctx, `SELECT id FROM messages`)
@@ -290,11 +312,11 @@ type ListItem struct {
 
 // Query selects a page of messages.
 type Query struct {
-	Box        string
-	Text       string
-	UnreadOnly bool
-	Limit      int
-	Offset     int
+	Box    string
+	From   string // exact sender address
+	Text   string
+	Limit  int
+	Offset int
 }
 
 // maxLimit caps a page so a crafted request cannot pull the whole mailbox.
@@ -316,8 +338,9 @@ func (i *index) List(ctx context.Context, q Query) (items []ListItem, total int,
 		where = append(where, "m.box = ?")
 		args = append(args, q.Box)
 	}
-	if q.UnreadOnly {
-		where = append(where, "m.unread = 1")
+	if q.From != "" {
+		where = append(where, "m.from_addr = ?")
+		args = append(args, q.From)
 	}
 
 	from := "messages m"

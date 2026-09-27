@@ -48,7 +48,8 @@ from cron (cron has no shell environment, so use `file:` secrets):
 ```
 
 A running `serve` shows what `sync` stored when you press `g` (Refresh) or
-reload the page. `serve` is also what returns delayed mail to its box, at
+reload the page; an open page checks every 30 seconds and shows a banner when
+new mail has arrived. `serve` is also what returns delayed mail to its box, at
 startup and every minute while it runs.
 
 Downloading is usually what limits a sync, so `sync` fetches batches over
@@ -80,21 +81,37 @@ From any box, on any message:
 | `i` | Ignore  | blacklists the sender (a rule to Spam) and moves the message to **Spam**; optionally sweeps up everything you already have from them |
 | `p` | Prio    | moves to **Priority** |
 | `d` | Delay   | asks for a number of days and parks it in **Delayed**; when the time is up it returns to *the box it was in*, not to the inbox |
-| `m` | Move    | any box, and optionally a standing rule so this sender always lands there |
-| `#` | Delete  | moves to **Trash**, and to the Trash folder on your IMAP account |
+| `m` | Move    | the sender's mail in this box (or, ticked, only this message) to any box; "Always move email from …", on by default, adds a rule so later mail lands there too |
+| `x` | Remove  | moves to **Trash**, and to the Trash folder on your IMAP account; when the sender has more mail in this box, it lists it (the newest 50) and offers to trash all of it |
 
 Other keys: `j`/`k` next/previous, `/` search, `g` refresh, `Esc` back out.
 
+**Summarize** (`s`) asks Claude for a TL;DR of the open message (at most four
+sentences), with a paragraph more behind **Explain more** (or `s` again). It
+runs the Claude Code CLI (`claude -p`), so it uses that login, a Claude
+subscription included, and needs no API key; the CLI is found on `PATH` or in
+`~/.local/bin`, or set `[summary] command = "/path/to/claude"` (and optionally
+`model`) in `config.toml`. The CLI runs with all tools, MCP servers and settings
+off, in an empty directory, so a message can only ever influence its own
+summary. Only the message you summarize leaves the machine. Summaries are kept
+in `mail.d/summaries/`, so each message is summarized once.
+
 Custom boxes are added in the sidebar. "Error mails" is the obvious one: make
-the box, then use **Move → Rule → Error mails** on a message from your CI, and
-every later mail from that sender files itself.
+the box, then **Move → Error mails** on a message from your CI: what is already
+in the box moves along, and every later mail from that sender files itself.
 
 Boxes `unprocessed`, `whitelisted`, `priority`, `delayed`, `processed`,
 `spam` and `trash` are built in and cannot be deleted.
 
-Moving a message to Spam (or any box) with `m` moves only that message. Future
-mail from the sender is only routed there by a rule: `i` (Ignore) creates one
-for Spam, and so does **Move → Rule**.
+Move and Remove only take mail from the box the message is in; the sender's
+mail in other boxes stays where it is. Future mail from the sender is only
+routed by a rule: `i` (Ignore) creates one for Spam, and Move creates one unless
+you untick "Always move email from …".
+
+**Filter**, at the top of any box but Trash, trashes every message in that box
+whose text contains a pattern (ignoring case; `%` matches anything in between,
+as in `backup % failed`). It previews the count and the newest 50 matches, with
+the matching text, as you type.
 
 **Archive all**, at the top of Unprocessed, moves everything there to Processed
 at once. Deleting a custom box moves its mail
@@ -172,7 +189,7 @@ made the next time it can; the sidebar shows how many are pending.
 Replies are also APPENDed to your Sent folder so your phone and Thunderbird see
 them.
 
-**Delete** (`#`) moves a message to the Trash box, and so to the Trash folder on
+**Remove** (`x`) moves a message to the Trash box, and so to the Trash folder on
 the server. Locally it stays on disk, so it is never downloaded again.
 
 ## Security

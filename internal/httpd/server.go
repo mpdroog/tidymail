@@ -28,6 +28,7 @@ import (
 	"github.com/mpdroog/tidymail/internal/imapsync"
 	"github.com/mpdroog/tidymail/internal/smtpsend"
 	"github.com/mpdroog/tidymail/internal/store"
+	"github.com/mpdroog/tidymail/internal/summarize"
 )
 
 //go:embed all:assets
@@ -69,6 +70,13 @@ type Server struct {
 	mirrorKick chan struct{}
 	// movingAll is set while a whole-box move runs in the background.
 	movingAll atomic.Bool
+	// jobs are the background moves of everything from one sender.
+	jobs jobs
+
+	// summarizer writes AI summaries; nil when no claude CLI was found.
+	summarizer *summarize.Summarizer
+	// summarizing bounds how many summaries run at once.
+	summarizing chan struct{}
 }
 
 // New builds the HTTP server.
@@ -77,7 +85,13 @@ func New(cfg *config.Config, st *store.Store, syncer *imapsync.Syncer, sender *s
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{cfg: cfg, st: st, syncer: syncer, sender: sender, log: logger, csrf: token, mux: http.NewServeMux(), mirrorKick: make(chan struct{}, 1)}
+	s := &Server{cfg: cfg, st: st, syncer: syncer, sender: sender, log: logger, csrf: token, mux: http.NewServeMux(), mirrorKick: make(chan struct{}, 1),
+		summarizing: make(chan struct{}, maxSummaries)}
+	if sum, sumErr := summarize.New(cfg.Summary.Command, cfg.Summary.Model, logger); sumErr != nil {
+		logger.Printf("http: summaries off: %v", sumErr)
+	} else {
+		s.summarizer = sum
+	}
 	if err := s.routes(); err != nil {
 		return nil, err
 	}
@@ -125,11 +139,19 @@ func (s *Server) routes() error {
 	s.mux.HandleFunc("POST /api/messages/{id}/move", s.handleMove)
 	s.mux.HandleFunc("POST /api/messages/{id}/read", s.handleRead)
 	s.mux.HandleFunc("POST /api/messages/{id}/delete", s.handleDelete)
+	s.mux.HandleFunc("GET /api/messages/{id}/sender", s.handleSenderPreview)
+	s.mux.HandleFunc("POST /api/messages/{id}/move-sender", s.handleMoveSender)
+	s.mux.HandleFunc("GET /api/jobs", s.handleJobs)
+	s.mux.HandleFunc("POST /api/messages/{id}/summary", s.handleSummarize)
+	s.mux.HandleFunc("GET /api/received", s.handleReceived)
 
 	s.mux.HandleFunc("GET /api/boxes", s.handleBoxes)
 	s.mux.HandleFunc("POST /api/boxes", s.handleCreateBox)
 	s.mux.HandleFunc("DELETE /api/boxes/{slug}", s.handleDeleteBox)
 	s.mux.HandleFunc("POST /api/boxes/{slug}/move-all", s.handleMoveAll)
+	s.mux.HandleFunc("POST /api/boxes/{slug}/mark-seen", s.handleMarkSeen)
+	s.mux.HandleFunc("GET /api/boxes/{slug}/body-matches", s.handleBodyMatches)
+	s.mux.HandleFunc("POST /api/boxes/{slug}/trash-body-matches", s.handleTrashBodyMatches)
 
 	s.mux.HandleFunc("GET /api/rules", s.handleRules)
 	s.mux.HandleFunc("POST /api/rules", s.handleAddRule)
@@ -272,7 +294,7 @@ func (s *Server) failFor(w http.ResponseWriter, r *http.Request, err error) {
 		s.fail(w, r, http.StatusNotFound, err)
 	case errors.Is(err, store.ErrUnknownBox), errors.Is(err, store.ErrInvalidRule),
 		errors.Is(err, store.ErrBadDelay), errors.Is(err, store.ErrBoxExists),
-		errors.Is(err, store.ErrSystemBox):
+		errors.Is(err, store.ErrSystemBox), errors.Is(err, store.ErrBadPattern):
 		s.fail(w, r, http.StatusBadRequest, err)
 	default:
 		s.fail(w, r, http.StatusInternalServerError, err)

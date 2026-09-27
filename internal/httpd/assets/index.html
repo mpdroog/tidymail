@@ -23,17 +23,24 @@
       <button type="submit" class="ghost">Add</button>
     </form>
 
+    <button type="button" id="show-rules" class="ghost small rules-link" title="See and remove the rules that file incoming mail">Rules</button>
+
     <div class="sidebar-foot" id="stats"></div>
   </nav>
 
   <section class="list-pane">
     <div class="searchbar">
       <input type="search" id="search" placeholder="Search  (from:ann invoice)" autocomplete="off">
-      <label class="toggle"><input type="checkbox" id="unread-only"> unread</label>
     </div>
+    <button type="button" id="new-mail" class="new-mail" hidden></button>
+    <div class="jobs" id="jobs" hidden></div>
     <div class="list-head">
       <span id="list-head"></span>
-      <button type="button" id="archive-all" class="ghost small" title="Move everything in Unprocessed to Processed" hidden>Archive all</button>
+      <div class="list-actions">
+        <button type="button" id="filter-body" class="ghost small" title="Trash every message in this box whose text matches a pattern" hidden>Filter</button>
+        <button type="button" id="mark-seen" class="ghost small" title="Mark every message in this box as seen" hidden>Mark all seen</button>
+        <button type="button" id="archive-all" class="ghost small" title="Move everything in Unprocessed to Processed" hidden>Archive all</button>
+      </div>
     </div>
     <ul class="messages" id="messages"></ul>
     <div class="pager">
@@ -52,8 +59,9 @@
         <dt>i</dt><dd>ignore: blacklist sender, to Spam</dd>
         <dt>p</dt><dd>priority</dd>
         <dt>d</dt><dd>delay for N days</dd>
-        <dt>m</dt><dd>move to a box</dd>
-        <dt>#</dt><dd>delete: to Trash, also on IMAP</dd>
+        <dt>m</dt><dd>move this sender's mail in this box (or just this one)</dd>
+        <dt>x</dt><dd>remove: to Trash, also on IMAP; offers the sender's other mail in this box</dd>
+        <dt>s</dt><dd>summarize with Claude (TL;DR, then more on request)</dd>
         <dt>/</dt><dd>search</dd>
         <dt>g</dt><dd>refresh</dd>
       </dl>
@@ -78,9 +86,16 @@
         <button type="button" data-act="prio">Prio <kbd>p</kbd></button>
         <button type="button" data-act="delay">Delay <kbd>d</kbd></button>
         <button type="button" data-act="move">Move <kbd>m</kbd></button>
-        <button type="button" data-act="delete" class="danger" title="Move to Trash, here and on the IMAP server">Delete <kbd>#</kbd></button>
+        <button type="button" data-act="remove" class="danger" title="Move to Trash, here and on the IMAP server; offers the sender's other mail in this box too">Remove <kbd>x</kbd></button>
+        <button type="button" data-act="summarize" id="summarize" title="Ask Claude for a short summary" hidden>Summarize <kbd>s</kbd></button>
         <a id="msg-raw" class="button ghost" href="#" download>Source</a>
       </div>
+
+      <section class="summary" id="summary" hidden>
+        <p class="summary-tldr"><span class="summary-label">TL;DR</span> <span id="summary-tldr"></span></p>
+        <button type="button" id="summary-more" class="ghost small">Explain more</button>
+        <p class="summary-details" id="summary-details" hidden></p>
+      </section>
 
       <ul class="attachments" id="attachments"></ul>
       <pre class="body" id="msg-body"></pre>

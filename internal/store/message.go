@@ -332,6 +332,48 @@ func (s *Store) ReleaseDue(ctx context.Context, now time.Time) (int, error) {
 	return moved, nil
 }
 
+// UnreadIDs returns the unread messages in box.
+func (s *Store) UnreadIDs(ctx context.Context, box string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.hasBoxLocked(box) {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownBox, box)
+	}
+	return s.idx.UnreadIDsInBox(ctx, box)
+}
+
+// ReceivedCount counts the mail that arrived outside Trash; see
+// index.ReceivedCount.
+func (s *Store) ReceivedCount(ctx context.Context) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.idx.ReceivedCount(ctx)
+}
+
+// MarkEachRead marks messages read and calls progress (when set) after each
+// one. Like MoveEach it locks per message, so a box of thousands does not
+// stall the UI.
+func (s *Store) MarkEachRead(ctx context.Context, ids []string, progress func(done, marked int)) (marked int, err error) {
+	for i, id := range ids {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return marked, fmt.Errorf("mark read: %w", ctxErr)
+		}
+		m, markErr := s.MarkRead(ctx, id, true)
+		switch {
+		case errors.Is(markErr, ErrNotFound):
+			s.log.Printf("store: mark read %s: %v", id, markErr)
+		case markErr != nil:
+			return marked, markErr
+		case m != nil:
+			marked++
+		}
+		if progress != nil {
+			progress(i+1, marked)
+		}
+	}
+	return marked, nil
+}
+
 // MarkRead sets or clears the unread flag.
 func (s *Store) MarkRead(ctx context.Context, id string, read bool) (*Message, error) {
 	s.mu.Lock()
@@ -370,31 +412,85 @@ func (s *Store) Ignore(ctx context.Context, id string, applyExisting bool) (move
 		return 0, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	ids := []string{id}
 	if applyExisting {
+		s.mu.RLock()
 		fromSender, lookupErr := s.idx.IDsFromSender(ctx, sender)
+		s.mu.RUnlock()
 		if lookupErr != nil {
 			return 0, lookupErr
 		}
 		ids = fromSender
 	}
-	for _, mid := range ids {
-		cur, readErr := s.readState(mid)
-		if readErr != nil {
-			s.log.Printf("store: ignore %s: %v", mid, readErr)
-			continue
+	return s.MoveEach(ctx, ids, "", BoxSpam, nil)
+}
+
+// SenderIDs returns the sender of message id, the box it is in, and every
+// message from that sender in the same box.
+func (s *Store) SenderIDs(ctx context.Context, id string) (sender, box string, ids []string, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, err := s.readState(id)
+	if err != nil {
+		return "", "", nil, err
+	}
+	sender = m.Mail.From.Address
+	if sender == "" {
+		return "", "", nil, fmt.Errorf("%w: message %s has no sender", ErrInvalidRule, id)
+	}
+	ids, err = s.idx.IDsFromSenderInBox(ctx, sender, m.Box)
+	return sender, m.Box, ids, err
+}
+
+// MoveEach moves messages to box and calls progress (when set) after each one.
+// With from set, only messages still in that box move; otherwise any not
+// already in box. A sender can have thousands of messages, so the lock is
+// taken per message, as in MoveAll: the UI keeps answering meanwhile.
+func (s *Store) MoveEach(ctx context.Context, ids []string, from, box string, progress func(done, moved int)) (moved int, err error) {
+	s.mu.RLock()
+	known := s.hasBoxLocked(box)
+	s.mu.RUnlock()
+	if !known {
+		return 0, fmt.Errorf("%w: %s", ErrUnknownBox, box)
+	}
+	for i, id := range ids {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return moved, fmt.Errorf("move to %s: %w", box, ctxErr)
 		}
-		if cur.Box == BoxSpam {
-			continue
+		var ok bool
+		var moveErr error
+		if from != "" {
+			ok, moveErr = s.moveIfIn(ctx, id, from, box)
+		} else {
+			ok, moveErr = s.moveUnlessIn(ctx, id, box)
 		}
-		if moveErr := s.setBoxLocked(ctx, mid, BoxSpam, cur.Box, 0); moveErr != nil {
+		if moveErr != nil {
 			return moved, moveErr
 		}
-		moved++
+		if ok {
+			moved++
+		}
+		if progress != nil {
+			progress(i+1, moved)
+		}
 	}
 	return moved, nil
+}
+
+// moveUnlessIn moves one message to box unless it is already there. A message
+// whose state cannot be read is logged and skipped.
+func (s *Store) moveUnlessIn(ctx context.Context, id, box string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.readState(id)
+	if err != nil {
+		s.log.Printf("store: move %s to %s: %v", id, box, err)
+		return false, nil
+	}
+	if cur.Box == box {
+		return false, nil
+	}
+	return true, s.setBoxLocked(ctx, id, box, cur.Box, 0)
 }
 
 // ReplyTargets returns the addresses a reply to this message should go to:

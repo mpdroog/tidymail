@@ -193,6 +193,58 @@ button, input, textarea, select { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 
+.new-mail {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  padding: 6px 12px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.filter-input { width: 100%; }
+.filter-summary { min-height: 1.4em; }
+.match-list li { flex-wrap: wrap; }
+.match-snippet { flex-basis: 100%; color: var(--ink-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.summary {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--pane-alt);
+}
+.summary p { margin: 0; }
+.summary-label { font-weight: 700; color: var(--accent); margin-right: 4px; }
+.summary .summary-details { margin-top: 8px; }
+.summary .ghost { margin-top: 6px; }
+
+.rules-link { margin: 0 10px 8px; align-self: flex-start; }
+.rule-list li { align-items: center; }
+.rule-list .tag { flex: 0 0 auto; }
+.rule-list button { flex: 0 0 auto; }
+
+.list-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+
+.jobs {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.job + .job { margin-top: 8px; }
+.job-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 3px; }
+.job-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-count { flex: 0 0 auto; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.job progress { width: 100%; height: 6px; accent-color: var(--accent); }
+
+.check { display: block; margin: 6px 0; font-size: 13px; }
+.check + .choices { margin-top: 12px; }
+
 .list-head {
   display: flex;
   justify-content: space-between;
@@ -501,6 +553,27 @@ button.primary kbd { border-color: rgba(255, 255, 255, 0.4); color: inherit; bac
 .modal-foot { margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
 
 .choices { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.sender-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.sender-list li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+}
+.sender-list li:last-child { border-bottom: none; }
+.sender-date { flex: 0 0 auto; color: var(--ink-soft); }
+.sender-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .choices button { flex: 0 0 auto; }
 
 .custom-delay { display: flex; gap: 8px; margin-top: 12px; align-items: center; }

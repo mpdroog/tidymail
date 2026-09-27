@@ -14,6 +14,7 @@ import (
 	"github.com/mpdroog/tidymail/internal/mailparse"
 	"github.com/mpdroog/tidymail/internal/smtpsend"
 	"github.com/mpdroog/tidymail/internal/store"
+	"github.com/mpdroog/tidymail/internal/summarize"
 )
 
 // boxView is a box plus its message tally.
@@ -25,11 +26,12 @@ type boxView struct {
 
 // stateView is everything the UI needs to draw its chrome.
 type stateView struct {
-	CSRF     string       `json:"csrf"`
-	Boxes    []boxView    `json:"boxes"`
-	Rules    []store.Rule `json:"rules"`
-	Stats    store.Stats  `json:"stats"`
-	FromAddr string       `json:"from_addr"`
+	CSRF      string       `json:"csrf"`
+	Summaries bool         `json:"summaries"` // whether AI summaries can be made
+	Boxes     []boxView    `json:"boxes"`
+	Rules     []store.Rule `json:"rules"`
+	Stats     store.Stats  `json:"stats"`
+	FromAddr  string       `json:"from_addr"`
 }
 
 func (s *Server) boxViews(ctx context.Context) ([]boxView, error) {
@@ -58,11 +60,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, r, http.StatusOK, stateView{
-		CSRF:     s.csrf,
-		Boxes:    boxes,
-		Rules:    s.st.Rules(),
-		Stats:    stats,
-		FromAddr: s.cfg.SMTP.FromAddr,
+		CSRF:      s.csrf,
+		Summaries: s.summarizer != nil,
+		Boxes:     boxes,
+		Rules:     s.st.Rules(),
+		Stats:     stats,
+		FromAddr:  s.cfg.SMTP.FromAddr,
 	})
 }
 
@@ -97,11 +100,10 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := store.Query{
-		Box:        q.Get("box"),
-		Text:       q.Get("q"),
-		UnreadOnly: q.Get("unread") == "1",
-		Limit:      limit,
-		Offset:     offset,
+		Box:    q.Get("box"),
+		Text:   q.Get("q"),
+		Limit:  limit,
+		Offset: offset,
 	}
 	items, total, err := s.st.List(r.Context(), query)
 	if err != nil {
@@ -118,6 +120,7 @@ type messageView struct {
 	ReplyTo     []mailparse.Address `json:"reply_targets"`
 	ReplySubj   string              `json:"reply_subject"`
 	Whitelisted bool                `json:"whitelisted"`
+	Summary     *store.Summary      `json:"summary,omitempty"`
 }
 
 func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
@@ -138,8 +141,14 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	// Opening a message marks it read; a failure here is worth logging but
 	// must not hide the message itself.
-	if _, err := s.st.MarkRead(r.Context(), m.ID, true); err != nil {
-		s.log.Printf("http: mark %s read: %v", m.ID, err)
+	if _, markErr := s.st.MarkRead(r.Context(), m.ID, true); markErr != nil {
+		s.log.Printf("http: mark %s read: %v", m.ID, markErr)
+	}
+
+	summary, err := s.st.Summary(m.ID)
+	if err != nil {
+		// A broken summary file is not worth hiding the message over.
+		s.log.Printf("http: summary of %s: %v", m.ID, err)
 	}
 
 	whitelisted := false
@@ -155,7 +164,66 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		ReplyTo:     m.ReplyTargets(),
 		ReplySubj:   m.ReplySubject(),
 		Whitelisted: whitelisted,
+		Summary:     summary,
 	})
+}
+
+// maxSummaries is how many claude processes may run at once.
+const maxSummaries = 2
+
+// handleSummarize returns the summary of a message, making it first when
+// there is none yet. Making one takes 5 to 15 seconds.
+func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
+	if s.summarizer == nil {
+		s.fail(w, r, http.StatusServiceUnavailable, errors.New("summaries need the claude CLI, which was not found; set [summary] command in config.toml"))
+		return
+	}
+	m, err := s.st.Get(r.PathValue("id"))
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	select {
+	case s.summarizing <- struct{}{}:
+		defer func() { <-s.summarizing }()
+	case <-r.Context().Done():
+		s.fail(w, r, http.StatusServiceUnavailable, r.Context().Err())
+		return
+	}
+	// A second press while the first was running finds its result here.
+	if have, sumErr := s.st.Summary(m.ID); sumErr == nil && have != nil {
+		s.writeJSON(w, r, http.StatusOK, have)
+		return
+	}
+
+	raw, err := s.st.Raw(m.ID)
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	parsed, err := mailparse.Parse(raw)
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	out, err := s.summarizer.Summarize(r.Context(), summarize.Mail{
+		From:    m.Mail.From.String(),
+		To:      strings.Join(mailparse.AddressStrings(m.Mail.To), ", "),
+		Subject: m.Mail.Subject,
+		Date:    m.Mail.Date,
+		Body:    parsed.Text,
+	})
+	if err != nil {
+		s.log.Printf("http: summarize %s: %v", m.ID, err)
+		s.fail(w, r, http.StatusBadGateway, err)
+		return
+	}
+	sum := store.Summary{TLDR: out.TLDR, Details: out.Details, At: time.Now().UTC()}
+	if err := s.st.SaveSummary(m.ID, sum); err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, sum)
 }
 
 func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +374,175 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, r, http.StatusOK, actionResult{Message: m})
+}
+
+// senderPreview is what moving everything from one sender would take: how
+// many messages, and the newest of them.
+type senderPreview struct {
+	Address string           `json:"address"`
+	Box     string           `json:"box"`
+	Total   int              `json:"total"`
+	Items   []store.ListItem `json:"items"`
+}
+
+// senderPreviewLimit is how many messages the confirmation shows.
+const senderPreviewLimit = 50
+
+// handleSenderPreview lists the mail from a message's sender in the box the
+// message is in: what Remove and Move would take along.
+func (s *Server) handleSenderPreview(w http.ResponseWriter, r *http.Request) {
+	m, err := s.st.Get(r.PathValue("id"))
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	addr := m.Mail.From.Address
+	if addr == "" {
+		s.fail(w, r, http.StatusBadRequest, errors.New("this message has no sender"))
+		return
+	}
+	query := store.Query{From: addr, Box: m.Box, Limit: senderPreviewLimit}
+	items, total, err := s.st.List(r.Context(), query)
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, senderPreview{Address: addr, Box: m.Box, Total: total, Items: items})
+}
+
+// handleMoveSender moves everything from a message's sender that is in the
+// same box as the message to another box, in the background, optionally adding a rule for later mail too. It answers at once
+// with the job; GET /api/jobs reports its progress.
+func (s *Server) handleMoveSender(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Box  string `json:"box"`
+		Rule bool   `json:"rule"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		s.fail(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if !s.st.HasBox(req.Box) {
+		s.failFor(w, r, fmt.Errorf("%w: %s", store.ErrUnknownBox, req.Box))
+		return
+	}
+	addr, from, ids, err := s.st.SenderIDs(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	if req.Rule {
+		if ruleErr := s.st.AddRule(store.Rule{Field: store.MatchFrom, Address: addr, Box: req.Box}); ruleErr != nil {
+			s.failFor(w, r, ruleErr)
+			return
+		}
+	}
+
+	job := s.jobs.start(jobView{Kind: "move", Address: addr, Box: req.Box, Total: len(ids)})
+	ctx := context.WithoutCancel(r.Context())
+	go func() {
+		start := time.Now()
+		moved, moveErr := s.st.MoveEach(ctx, ids, from, req.Box, func(done, moved int) {
+			s.jobs.progress(job.ID, done, moved)
+		})
+		s.jobs.finish(job.ID, moved, moveErr)
+		if moveErr != nil {
+			s.log.Printf("http: moving mail from %s to %s stopped after %d message(s): %v", addr, req.Box, moved, moveErr)
+		} else {
+			s.log.Printf("http: moved %d message(s) from %s to %s in %s", moved, addr, req.Box, time.Since(start).Round(time.Millisecond))
+		}
+		s.kickMirror()
+	}()
+	s.writeJSON(w, r, http.StatusAccepted, job)
+}
+
+// handleMarkSeen marks every unread message in a box as seen, in the
+// background like handleMoveSender.
+func (s *Server) handleMarkSeen(w http.ResponseWriter, r *http.Request) {
+	box := r.PathValue("slug")
+	ids, err := s.st.UnreadIDs(r.Context(), box)
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	job := s.jobs.start(jobView{Kind: "seen", Box: box, Total: len(ids)})
+	ctx := context.WithoutCancel(r.Context())
+	go func() {
+		marked, markErr := s.st.MarkEachRead(ctx, ids, func(done, marked int) {
+			s.jobs.progress(job.ID, done, marked)
+		})
+		s.jobs.finish(job.ID, marked, markErr)
+		if markErr != nil {
+			s.log.Printf("http: marking %s seen stopped after %d message(s): %v", box, marked, markErr)
+		}
+	}()
+	s.writeJSON(w, r, http.StatusAccepted, job)
+}
+
+// bodyMatchView is the mail in a box whose body matches a pattern.
+type bodyMatchView struct {
+	Box     string           `json:"box"`
+	Pattern string           `json:"pattern"`
+	Total   int              `json:"total"`
+	Items   []store.ListItem `json:"items"`
+}
+
+// handleBodyMatches previews what a body filter would trash: how many match,
+// and the newest with the text around the match.
+func (s *Server) handleBodyMatches(w http.ResponseWriter, r *http.Request) {
+	box, pattern := r.PathValue("slug"), r.URL.Query().Get("body")
+	items, total, err := s.st.BodyMatches(r.Context(), box, pattern, senderPreviewLimit)
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, bodyMatchView{Box: box, Pattern: pattern, Total: total, Items: items})
+}
+
+// handleTrashBodyMatches moves every message in a box whose body matches a
+// pattern to Trash, in the background like handleMoveSender.
+func (s *Server) handleTrashBodyMatches(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Body string `json:"body"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		s.fail(w, r, http.StatusBadRequest, err)
+		return
+	}
+	box := r.PathValue("slug")
+	ids, err := s.st.BodyMatchIDs(r.Context(), box, req.Body)
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	job := s.jobs.start(jobView{Kind: "filter", Box: box, Pattern: req.Body, Total: len(ids)})
+	ctx := context.WithoutCancel(r.Context())
+	go func() {
+		moved, moveErr := s.st.MoveEach(ctx, ids, box, store.BoxTrash, func(done, moved int) {
+			s.jobs.progress(job.ID, done, moved)
+		})
+		s.jobs.finish(job.ID, moved, moveErr)
+		if moveErr != nil {
+			s.log.Printf("http: trashing %s mail matching %q stopped after %d message(s): %v", box, req.Body, moved, moveErr)
+		}
+		s.kickMirror()
+	}()
+	s.writeJSON(w, r, http.StatusAccepted, job)
+}
+
+// handleReceived reports how much mail has arrived outside Trash, so an open
+// page can tell when it is out of date.
+func (s *Server) handleReceived(w http.ResponseWriter, r *http.Request) {
+	n, err := s.st.ReceivedCount(r.Context())
+	if err != nil {
+		s.failFor(w, r, err)
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, map[string]int{"count": n})
+}
+
+func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, r, http.StatusOK, s.jobs.snapshot())
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {

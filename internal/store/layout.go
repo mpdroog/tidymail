@@ -42,10 +42,11 @@ const (
 	indexFile   = "index.db"
 	gitIgnore   = ".gitignore"
 
-	mailDir   = "mail"
-	stateDir  = "state"
-	outboxDir = "outbox"
-	tmpDir    = "tmp"
+	mailDir    = "mail"
+	stateDir   = "state"
+	summaryDir = "summaries"
+	outboxDir  = "outbox"
+	tmpDir     = "tmp"
 )
 
 // dirPerm and filePerm keep mail.d readable by its owner only; it holds

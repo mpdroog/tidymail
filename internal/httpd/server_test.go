@@ -431,3 +431,135 @@ func TestUnmirroredAccountNeverTouchesTheServer(t *testing.T) {
 		t.Errorf("pending = %d, want 0: an unmirrored account has nothing to move", state.Stats.PendingIMAP)
 	}
 }
+
+func TestBulkDeleteEndpoints(t *testing.T) {
+	srv, st := newTestServer(t)
+	a := seed(t, st, "news@example.com", "deal1", "weekly newsletter")
+	b := seed(t, st, "news@example.com", "deal2", "weekly newsletter")
+	c := seed(t, st, "ann@example.com", "lunch", "shall we")
+	d := seed(t, st, "bob@example.com", "report", "quarterly numbers")
+
+	moved := func(rec *httptest.ResponseRecorder) int {
+		t.Helper()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		var res struct {
+			Moved int `json:"moved"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return res.Moved
+	}
+	boxOf := func(id string) string {
+		t.Helper()
+		m, err := st.Get(id)
+		if err != nil {
+			t.Fatalf("Get %s: %v", id, err)
+		}
+		return m.Box
+	}
+
+	// Ticked ids.
+	if n := moved(do(t, srv, http.MethodPost, "/api/messages/bulk", `{"ids":["`+c.ID+`"],"action":"move","box":"trash"}`, true)); n != 1 || boxOf(c.ID) != store.BoxTrash {
+		t.Fatalf("move ticked: moved %d, box %s", n, boxOf(c.ID))
+	}
+	// All results of a search.
+	if n := moved(do(t, srv, http.MethodPost, "/api/messages/bulk", `{"all":true,"q":"quarterly","action":"move","box":"trash"}`, true)); n != 1 || boxOf(d.ID) != store.BoxTrash {
+		t.Fatalf("move matching: moved %d, box %s", n, boxOf(d.ID))
+	}
+	// Everything from one sender.
+	if n := moved(do(t, srv, http.MethodPost, "/api/messages/"+a.ID+"/delete-sender", `{}`, true)); n != 2 || boxOf(b.ID) != store.BoxTrash {
+		t.Fatalf("delete sender: moved %d, box %s", n, boxOf(b.ID))
+	}
+	// Deleting one ticked Trash message for good.
+	if n := moved(do(t, srv, http.MethodPost, "/api/messages/purge", `{"ids":["`+c.ID+`"]}`, true)); n != 1 {
+		t.Fatalf("purge removed %d, want 1", n)
+	}
+	// Empty trash removes the other three.
+	if n := moved(do(t, srv, http.MethodPost, "/api/boxes/trash/empty", `{}`, true)); n != 3 {
+		t.Fatalf("empty trash removed %d, want 3", n)
+	}
+	if rec := do(t, srv, http.MethodGet, "/api/messages/"+a.ID, "", false); rec.Code != http.StatusNotFound {
+		t.Fatalf("emptied message = %d, want 404", rec.Code)
+	}
+
+	for name, req := range map[string][2]string{
+		"empty another box":  {"/api/boxes/unprocessed/empty", `{}`},
+		"match everything":   {"/api/messages/bulk", `{"all":true,"action":"move","box":"trash"}`},
+		"no ids":             {"/api/messages/bulk", `{"ids":[],"action":"move","box":"trash"}`},
+		"purge without ids":  {"/api/messages/purge", `{"ids":[]}`},
+		"unknown target box": {"/api/messages/bulk", `{"ids":["` + a.ID + `"],"action":"move","box":"nowhere"}`},
+		"unknown action":     {"/api/messages/bulk", `{"ids":["` + a.ID + `"],"action":"explode"}`},
+	} {
+		if rec := do(t, srv, http.MethodPost, req[0], req[1], true); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d, want 400: %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := do(t, srv, http.MethodPost, "/api/boxes/trash/empty", `{}`, false); rec.Code != http.StatusForbidden {
+		t.Errorf("empty trash without CSRF token = %d, want 403", rec.Code)
+	}
+}
+
+func TestBulkActionsOnASelection(t *testing.T) {
+	srv, st := newTestServer(t)
+	a := seed(t, st, "promo@shop.example", "sale1", "big sale")
+	b := seed(t, st, "promo@shop.example", "sale2", "bigger sale")
+	c := seed(t, st, "ann@example.com", "hello", "hi there")
+	ids := `"ids":["` + a.ID + `","` + b.ID + `","` + c.ID + `"]`
+
+	bulk := func(body string) (done, skipped int) {
+		t.Helper()
+		rec := do(t, srv, http.MethodPost, "/api/messages/bulk", body, true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("bulk %s = %d: %s", body, rec.Code, rec.Body.String())
+		}
+		var res struct {
+			Moved   int `json:"moved"`
+			Skipped int `json:"skipped"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return res.Moved, res.Skipped
+	}
+	get := func(id string) *store.Message {
+		t.Helper()
+		m, err := st.Get(id)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		return m
+	}
+
+	if n, _ := bulk(`{` + ids + `,"action":"read"}`); n != 3 || get(a.ID).Unread {
+		t.Fatalf("read: %d done, a unread=%v", n, get(a.ID).Unread)
+	}
+	if n, _ := bulk(`{` + ids + `,"action":"unread"}`); n != 3 || !get(c.ID).Unread {
+		t.Fatalf("unread: %d done, c unread=%v", n, get(c.ID).Unread)
+	}
+	if n, _ := bulk(`{` + ids + `,"action":"delay","days":3}`); n != 3 || get(b.ID).Box != store.BoxDelayed || get(b.ID).PrevBox != store.BoxUnprocessed {
+		t.Fatalf("delay: %d done, b = %s (was %s)", n, get(b.ID).Box, get(b.ID).PrevBox)
+	}
+	if rec := do(t, srv, http.MethodPost, "/api/messages/bulk", `{`+ids+`,"action":"delay","days":0}`, true); rec.Code != http.StatusBadRequest {
+		t.Errorf("delay 0 days = %d, want 400", rec.Code)
+	}
+	// Ignoring both promo mails blacklists their sender once.
+	if n, _ := bulk(`{"ids":["` + a.ID + `","` + b.ID + `"],"action":"ignore"}`); n != 2 || get(a.ID).Box != store.BoxSpam {
+		t.Fatalf("ignore: %d done, a in %s", n, get(a.ID).Box)
+	}
+	rules := 0
+	for _, r := range st.Rules() {
+		if r.Address == "promo@shop.example" && r.Box == store.BoxSpam {
+			rules++
+		}
+	}
+	if rules != 1 {
+		t.Errorf("rules for the ignored sender = %d, want 1", rules)
+	}
+	// A vanished message is skipped, not an error.
+	if n, skipped := bulk(`{"ids":["` + c.ID + `","0123456789abcdef0123456789abcdef"],"action":"read"}`); n != 1 || skipped != 1 {
+		t.Errorf("read with a missing id: %d done, %d skipped; want 1, 1", n, skipped)
+	}
+}

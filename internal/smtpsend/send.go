@@ -42,6 +42,15 @@ type Reply struct {
 	Quote string
 	// QuoteAttribution is the "On <date>, <who> wrote:" line.
 	QuoteAttribution string
+	// Attachments are sent as files next to the text.
+	Attachments []Attachment
+}
+
+// Attachment is a file sent with a message.
+type Attachment struct {
+	Filename    string
+	ContentType string
+	Data        []byte
 }
 
 // ErrNoRecipient is returned when a reply has nobody to go to.
@@ -74,6 +83,9 @@ func (s *Sender) Compose(r Reply, now time.Time) ([]byte, error) {
 	if err := h.GenerateMessageID(); err != nil {
 		return nil, fmt.Errorf("generate message id: %w", err)
 	}
+	if len(r.Attachments) > 0 {
+		return composeMixed(h, buildBody(r), r.Attachments)
+	}
 	h.SetContentType("text/plain", map[string]string{"charset": "utf-8"})
 
 	var buf bytes.Buffer
@@ -92,6 +104,56 @@ func (s *Sender) Compose(r Reply, now time.Time) ([]byte, error) {
 		return nil, fmt.Errorf("close message writer: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// composeMixed renders a multipart/mixed message: the text, then one part per
+// attachment.
+func composeMixed(h mail.Header, body string, atts []Attachment) ([]byte, error) {
+	var buf bytes.Buffer
+	mw, err := mail.CreateWriter(&buf, h)
+	if err != nil {
+		return nil, fmt.Errorf("create message writer: %w", err)
+	}
+	var th mail.InlineHeader
+	th.SetContentType("text/plain", map[string]string{"charset": "utf-8"})
+	tw, err := mw.CreateSingleInline(th)
+	if err != nil {
+		return nil, fmt.Errorf("create text part: %w", err)
+	}
+	if err := writeAndClose(tw, []byte(body)); err != nil {
+		return nil, fmt.Errorf("write text part: %w", err)
+	}
+	for _, a := range atts {
+		var ah mail.AttachmentHeader
+		ctype := a.ContentType
+		if ctype == "" {
+			ctype = "application/octet-stream"
+		}
+		ah.SetContentType(ctype, nil)
+		ah.SetFilename(a.Filename)
+		aw, err := mw.CreateAttachment(ah)
+		if err != nil {
+			return nil, fmt.Errorf("create attachment %q: %w", a.Filename, err)
+		}
+		if err := writeAndClose(aw, a.Data); err != nil {
+			return nil, fmt.Errorf("write attachment %q: %w", a.Filename, err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, fmt.Errorf("close message writer: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// writeAndClose writes one part and closes it, reporting both failures.
+func writeAndClose(w io.WriteCloser, data []byte) error {
+	if _, err := w.Write(data); err != nil {
+		if cerr := w.Close(); cerr != nil {
+			return fmt.Errorf("%w (and close: %w)", err, cerr)
+		}
+		return err
+	}
+	return w.Close()
 }
 
 // buildBody joins the reply text with the quoted original.

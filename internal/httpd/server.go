@@ -54,6 +54,22 @@ const downloadPolicy = "default-src 'none'; sandbox"
 // maxRequestBody caps a JSON request. Replies are text, so this is generous.
 const maxRequestBody = 1 << 20 // 1 MiB
 
+// maxAttachments caps the files sent with one message; many mail servers
+// refuse more once it is encoded.
+const maxAttachments = 20 << 20 // 20 MiB
+
+// maxComposeBody caps a send or reply request with its attachments: the files
+// plus the multipart framing and the text.
+const maxComposeBody = maxAttachments + 2<<20
+
+// takesAttachments reports whether a request may carry files: sending a new
+// message and replying.
+func takesAttachments(r *http.Request) bool {
+	p := r.URL.Path
+	return r.Method == http.MethodPost && (p == "/api/send" ||
+		(strings.HasPrefix(p, "/api/messages/") && strings.HasSuffix(p, "/reply")))
+}
+
 // Account is the pair of mail transports for one configured account.
 type Account struct {
 	Name   string // as in config; "" is the single unnamed account
@@ -173,6 +189,11 @@ func (s *Server) routes() error {
 	s.mux.HandleFunc("GET /api/messages/{id}", s.handleMessage)
 	s.mux.HandleFunc("GET /api/messages/{id}/attachments/{part}", s.handleAttachment)
 	s.mux.HandleFunc("GET /api/messages/{id}/raw", s.handleRaw)
+	s.mux.HandleFunc("POST /api/messages/bulk", s.handleBulk)
+	s.mux.HandleFunc("POST /api/send", s.handleSend)
+	s.mux.HandleFunc("POST /api/messages/purge", s.handlePurge)
+	s.mux.HandleFunc("POST /api/messages/{id}/delete-sender", s.handleDeleteSender)
+	s.mux.HandleFunc("POST /api/boxes/{slug}/empty", s.handleEmptyBox)
 
 	s.mux.HandleFunc("POST /api/messages/{id}/reply", s.handleReply)
 	s.mux.HandleFunc("POST /api/messages/{id}/ignore", s.handleIgnore)
@@ -265,7 +286,11 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 // custom header without a preflight, and no CORS headers are ever sent.
 func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		limit := int64(maxRequestBody)
+		if takesAttachments(r) {
+			limit = maxComposeBody
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			next.ServeHTTP(w, r)

@@ -11,6 +11,8 @@ const state = {
   csrf: "",
   boxes: [],
   fromAddr: "",
+  accounts: [], // what a new message can be sent from
+  files: { newmail: [], compose: [] }, // attachments picked per form
   box: "unprocessed",
   query: "",
   unreadOnly: false,
@@ -20,6 +22,8 @@ const state = {
   items: [],
   selected: -1,
   message: null,
+  checked: new Set(), // ids ticked for a bulk action
+  allResults: false, // the whole query is selected, not just the ticked ids
 };
 
 const el = (id) => document.getElementById(id);
@@ -28,7 +32,12 @@ const el = (id) => document.getElementById(id);
 
 async function api(path, options = {}) {
   const opts = { credentials: "same-origin", headers: {}, ...options };
-  if (opts.body !== undefined) {
+  if (opts.form !== undefined) {
+    // Multipart upload: the browser sets the Content-Type with its boundary.
+    opts.method = opts.method || "POST";
+    opts.body = opts.form;
+    delete opts.form;
+  } else if (opts.body !== undefined) {
     opts.method = opts.method || "POST";
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(opts.body);
@@ -120,6 +129,7 @@ async function loadState() {
   state.csrf = data.csrf;
   state.boxes = data.boxes;
   state.fromAddr = data.from_addr;
+  state.accounts = data.accounts || [];
   renderBoxes();
   renderStats(data.stats);
 }
@@ -169,6 +179,7 @@ function selectBox(slug) {
   state.box = slug;
   state.offset = 0;
   state.selected = -1;
+  clearChecked();
   renderBoxes();
   loadList().catch(report);
 }
@@ -198,12 +209,27 @@ function renderList() {
 
   const list = el("messages");
   clear(list);
+  const checkable = bulkAllowed();
+  list.classList.toggle("checkable", checkable);
 
   state.items.forEach((item, i) => {
     const li = document.createElement("li");
     li.tabIndex = 0;
     li.setAttribute("aria-selected", String(i === state.selected));
     if (item.unread) li.classList.add("unread");
+
+    if (checkable) {
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "row-check";
+      box.checked = state.allResults || state.checked.has(item.id);
+      box.setAttribute("aria-label", "Select message");
+      box.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        toggleChecked(item.id, box.checked);
+      });
+      li.append(box);
+    }
 
     const top = document.createElement("div");
     top.className = "row-top";
@@ -241,6 +267,287 @@ function renderList() {
   el("prev-page").disabled = state.offset === 0;
   el("next-page").disabled = state.offset + state.limit >= state.total;
   el("archive-all").hidden = !(state.box === "unprocessed" && !state.query && state.total > 0);
+  el("empty-trash").hidden = !(state.box === "trash" && !state.query && state.total > 0);
+  renderBulk();
+}
+
+/* ---------- bulk selection ----------------------------------------------- */
+
+// bulkAllowed: every list can tick messages. In Trash itself the bulk action
+// deletes for good instead of moving to Trash.
+function bulkAllowed() {
+  return true;
+}
+
+// inTrash: the list is the Trash box, not a search across boxes.
+function inTrash() {
+  return state.box === "trash" && !state.query;
+}
+
+function clearChecked() {
+  state.checked.clear();
+  state.allResults = false;
+}
+
+function toggleChecked(id, on) {
+  if (state.allResults) {
+    // Unticking one row turns "all results" back into this page's ticks.
+    state.allResults = false;
+    for (const it of state.items) state.checked.add(it.id);
+  }
+  if (on) state.checked.add(id);
+  else state.checked.delete(id);
+  renderList();
+}
+
+function pageFullyChecked() {
+  return state.items.length > 0 && (state.allResults || state.items.every((it) => state.checked.has(it.id)));
+}
+
+function renderBulk() {
+  const allowed = bulkAllowed();
+  const page = el("select-page");
+  page.hidden = !allowed || state.items.length === 0;
+  page.checked = pageFullyChecked();
+
+  const count = state.allResults ? state.total : state.checked.size;
+  const active = allowed && count > 0;
+  el("bulkbar").hidden = !active;
+  document.querySelector(".list-head").classList.toggle("bulk", active);
+  el("bulk-count").textContent = state.allResults
+    ? `All ${state.total} message(s) selected`
+    : `${count} selected`;
+  const all = el("bulk-all");
+  all.hidden = state.allResults || !pageFullyChecked() || state.total <= state.items.length;
+  all.textContent = `Select all ${state.total}`;
+  const del = el("bulk-delete");
+  del.textContent = inTrash() ? "Delete for good" : "Delete";
+  del.classList.toggle("solid", inTrash());
+  // In Trash the only sensible actions are restoring (Move) and deleting.
+  for (const id of ["bulk-prio", "bulk-delay", "bulk-ignore", "bulk-read", "bulk-unread"]) {
+    el(id).hidden = inTrash();
+  }
+}
+
+function togglePage(on) {
+  if (!on) {
+    clearChecked();
+  } else {
+    for (const it of state.items) state.checked.add(it.id);
+  }
+  renderList();
+}
+
+function selectedCount() {
+  return state.allResults ? state.total : state.checked.size;
+}
+
+// selectionBody says which messages a bulk action is for: the ticked ids, or
+// every message the current box or search matches.
+function selectionBody() {
+  return state.allResults
+    ? { all: true, in: state.query ? "" : state.box, q: state.query, unread: state.unreadOnly }
+    : { ids: Array.from(state.checked) };
+}
+
+// runBulk sends one action for the whole selection. verb names it in the
+// progress note ("Moving"), done in the result ("moved to Trash").
+async function runBulk(action, verb, done) {
+  const count = selectedCount();
+  if (count === 0) return;
+  const res = await busy(`${verb} ${count} message(s)…`,
+    () => api("/api/messages/bulk", { method: "POST", body: { ...selectionBody(), ...action } }));
+  clearChecked();
+  const skipped = res.skipped ? `, ${res.skipped} skipped` : "";
+  await afterBulk(`${res.moved || 0} message(s) ${done}${skipped}.`);
+}
+
+// busy shows that a slow request is running: a large move writes one file per
+// message and can take a few seconds.
+async function busy(note, run) {
+  toast(note);
+  document.body.classList.add("busy");
+  try {
+    return await run();
+  } finally {
+    document.body.classList.remove("busy");
+  }
+}
+
+// confirmAll asks first when the selection is "all results": that reaches far
+// beyond the page on screen. A ticked selection is visible, so it just runs.
+function confirmAll(what, run) {
+  if (!state.allResults) {
+    run().catch(report);
+    return;
+  }
+  const where = state.query ? `matching "${state.query}"` : `in ${boxName(state.box)}`;
+  openModal(`${what} all ${state.total} message(s) ${where}?`, (body, done) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "primary";
+    b.textContent = `${what} ${state.total} message(s)`;
+    b.addEventListener("click", () => {
+      done();
+      run().catch(report);
+    });
+    body.append(b);
+  });
+}
+
+function bulkMoveTo(box) {
+  if (box === "trash") {
+    confirmAll("Delete", () => runBulk({ action: "move", box }, "Moving", "moved to Trash"));
+    return;
+  }
+  confirmAll(`Move to ${boxName(box)}:`, () => runBulk({ action: "move", box }, "Moving", `moved to ${boxName(box)}`));
+}
+
+function askBulkMove() {
+  openModal(`Move ${selectedCount()} message(s) to which box?`, (body, done) => {
+    const choices = document.createElement("div");
+    choices.className = "choices";
+    for (const box of state.boxes) {
+      if (box.slug === state.box && !state.query) continue;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = box.name;
+      b.addEventListener("click", () => {
+        done();
+        bulkMoveTo(box.slug);
+      });
+      choices.append(b);
+    }
+    body.append(choices);
+  });
+}
+
+function askBulkDelay() {
+  askDays(`Delay ${selectedCount()} message(s) for how long?`, (days) => {
+    confirmAll("Delay", () => runBulk({ action: "delay", days }, "Delaying", `delayed ${days} day(s)`));
+  });
+}
+
+function askBulkIgnore() {
+  const count = selectedCount();
+  openModal(`Blacklist the senders of ${count} message(s)?`, (body, done) => {
+    const p = document.createElement("p");
+    p.textContent = "These messages move to Spam, and future mail from their senders goes straight to Spam.";
+    body.append(p);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "primary";
+    b.textContent = "Ignore senders";
+    b.addEventListener("click", () => {
+      done();
+      runBulk({ action: "ignore" }, "Ignoring", "moved to Spam, senders blacklisted").catch(report);
+    });
+    body.append(b);
+  });
+}
+
+function bulkRead(read) {
+  const action = read ? "read" : "unread";
+  confirmAll(`Mark as ${action}:`, () => runBulk({ action }, "Marking", `marked ${action}`));
+}
+
+function confirmBulkDelete() {
+  if (inTrash()) {
+    confirmPurge();
+    return;
+  }
+  bulkMoveTo("trash");
+}
+
+// afterBulk reloads after an action on many messages; the open message may be
+// among them, so the reading pane starts empty.
+async function afterBulk(note) {
+  toast(note);
+  showEmpty();
+  await Promise.all([loadList(), refreshBoxes(), loadState()]);
+}
+
+function confirmDeleteSender() {
+  const msg = state.message;
+  if (!msg) return;
+  const sender = msg.mail.from.address;
+  if (!sender) {
+    toast("This message has no sender address.", "error");
+    return;
+  }
+  openModal(`Move all mail from ${sender} to Trash?`, (body, done) => {
+    const p = document.createElement("p");
+    p.textContent = "Every message from this sender, in every box. You can still get them back from Trash until you empty it.";
+    body.append(p);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "danger solid";
+    b.textContent = "Move all to Trash";
+    b.addEventListener("click", async () => {
+      done();
+      try {
+        const res = await busy(`Moving mail from ${sender} to Trash…`,
+          () => api(`/api/messages/${msg.id}/delete-sender`, { method: "POST", body: {} }));
+        await afterBulk(`${res.moved || 0} message(s) from ${sender} moved to Trash.`);
+      } catch (err) {
+        report(err);
+      }
+    });
+    body.append(b);
+  });
+}
+
+// confirmPurge deletes the ticked Trash messages for good; ticking all of
+// Trash is the same as emptying it.
+function confirmPurge() {
+  const count = state.allResults ? state.total : state.checked.size;
+  if (count === 0) return;
+  openModal(`Delete ${count} message(s) for good?`, (body, done) => {
+    const p = document.createElement("p");
+    p.textContent = "They are removed from this computer and cannot be brought back. " +
+      "Nothing changes on your mail servers, and tidymail will not download them again.";
+    body.append(p);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "danger solid";
+    b.textContent = `Delete ${count} for good`;
+    b.addEventListener("click", async () => {
+      done();
+      try {
+        const res = await busy(`Deleting ${count} message(s)…`, () => (state.allResults
+          ? api("/api/boxes/trash/empty", { method: "POST", body: {} })
+          : api("/api/messages/purge", { method: "POST", body: { ids: Array.from(state.checked) } })));
+        clearChecked();
+        await afterBulk(`${res.moved || 0} message(s) deleted for good.`);
+      } catch (err) {
+        report(err);
+      }
+    });
+    body.append(b);
+  });
+}
+
+function confirmEmptyTrash() {
+  openModal(`Delete ${state.total} message(s) in Trash for good?`, (body, done) => {
+    const p = document.createElement("p");
+    p.textContent = "They are removed from this computer and cannot be brought back. " +
+      "Nothing changes on your mail servers, and tidymail will not download them again.";
+    body.append(p);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "danger solid";
+    b.textContent = "Empty trash";
+    b.addEventListener("click", async () => {
+      done();
+      try {
+        const res = await busy("Emptying Trash…", () => api("/api/boxes/trash/empty", { method: "POST", body: {} }));
+        await afterBulk(`Trash emptied: ${res.moved || 0} message(s) deleted.`);
+      } catch (err) {
+        report(err);
+      }
+    });
+    body.append(b);
+  });
 }
 
 function openIndex(i) {
@@ -270,6 +577,7 @@ async function openMessage(id) {
 function renderMessage(msg) {
   el("empty-state").hidden = true;
   el("compose").hidden = true;
+  el("newmail").hidden = true;
   el("message").hidden = false;
 
   el("msg-subject").textContent = msg.mail.subject || "(no subject)";
@@ -338,8 +646,10 @@ function showEmpty() {
   state.selected = -1;
   el("message").hidden = true;
   el("compose").hidden = true;
-  el("empty-state").hidden = false;
-  document.querySelector(".app").classList.remove("reading");
+  // A new message being written stays open; it is only closed by Send or Cancel.
+  const writing = !el("newmail").hidden;
+  el("empty-state").hidden = writing;
+  document.querySelector(".app").classList.toggle("reading", writing);
   renderList();
 }
 
@@ -433,17 +743,20 @@ async function sendReply(ev) {
     return;
   }
   const cc = el("compose-cc").value.split(",").map((s) => s.trim()).filter(Boolean);
+  if (filesTooBig("compose")) {
+    toast("The attachments are larger than 20 MB together; remove some first.", "error");
+    return;
+  }
 
   button.disabled = true;
   document.body.classList.add("busy");
   try {
-    const res = await api(`/api/messages/${id}/reply`, {
-      method: "POST",
-      body: { body, cc, quote: el("compose-quote").checked },
-    });
+    const res = await sendWithFiles(`/api/messages/${id}/reply`, "compose",
+      { body, cc, quote: el("compose-quote").checked });
     el("compose").hidden = true;
     el("compose-body").value = "";
     el("compose-cc").value = "";
+    clearFiles("compose");
     await afterAction(res, "Reply sent, message filed as Processed.");
   } catch (err) {
     report(err);
@@ -468,6 +781,152 @@ function openCompose() {
   el("compose").scrollIntoView({ block: "nearest" });
 }
 
+/* ---------- attachments --------------------------------------------------- */
+
+// maxAttachBytes matches the server's limit for the files of one message.
+const maxAttachBytes = 20 * 1024 * 1024;
+
+function addFiles(form, list) {
+  for (const f of list) state.files[form].push(f);
+  renderFiles(form);
+}
+
+function clearFiles(form) {
+  state.files[form] = [];
+  el(`${form}-attach`).value = "";
+  renderFiles(form);
+}
+
+function filesTooBig(form) {
+  return state.files[form].reduce((n, f) => n + f.size, 0) > maxAttachBytes;
+}
+
+function renderFiles(form) {
+  const list = el(`${form}-files`);
+  clear(list);
+  const tooBig = filesTooBig(form);
+  state.files[form].forEach((f, i) => {
+    const li = document.createElement("li");
+    if (tooBig) li.classList.add("too-big");
+    li.append(document.createTextNode(`${f.name} `), span("size", humanSize(f.size)));
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.title = `Remove ${f.name}`;
+    drop.textContent = "×";
+    drop.addEventListener("click", () => {
+      state.files[form].splice(i, 1);
+      renderFiles(form);
+    });
+    li.append(drop);
+    list.append(li);
+  });
+}
+
+// sendWithFiles posts JSON, or multipart with the JSON in a "json" field when
+// files are attached.
+function sendWithFiles(path, form, body) {
+  const files = state.files[form];
+  if (files.length === 0) return api(path, { method: "POST", body });
+  const data = new FormData();
+  data.append("json", JSON.stringify(body));
+  for (const f of files) data.append("attachment", f, f.name);
+  return api(path, { method: "POST", form: data });
+}
+
+function wireAttachments(form) {
+  el(`${form}-attach`).addEventListener("change", (ev) => {
+    addFiles(form, ev.target.files);
+    ev.target.value = "";
+  });
+  const node = el(form);
+  node.addEventListener("dragover", (ev) => {
+    if (!ev.dataTransfer || !Array.from(ev.dataTransfer.types).includes("Files")) return;
+    ev.preventDefault();
+    node.classList.add("dropping");
+  });
+  node.addEventListener("dragleave", () => node.classList.remove("dropping"));
+  node.addEventListener("drop", (ev) => {
+    node.classList.remove("dropping");
+    if (!ev.dataTransfer || ev.dataTransfer.files.length === 0) return;
+    ev.preventDefault();
+    addFiles(form, ev.dataTransfer.files);
+  });
+}
+
+/* ---------- new message -------------------------------------------------- */
+
+// openNewMail shows an empty message form in the reading pane, sending from
+// the account of the open message when there is one.
+function openNewMail() {
+  const from = el("newmail-from");
+  clear(from);
+  for (const acct of state.accounts) {
+    const opt = document.createElement("option");
+    opt.value = acct.name;
+    opt.textContent = acct.from_name ? `${acct.from_name} <${acct.from_addr}>` : acct.from_addr;
+    from.append(opt);
+  }
+  const current = state.message && state.accounts.find((a) => a.from_addr === state.message.reply_from);
+  if (current) from.value = current.name;
+
+  el("empty-state").hidden = true;
+  el("message").hidden = true;
+  el("compose").hidden = true;
+  el("newmail").hidden = false;
+  document.querySelector(".app").classList.add("reading");
+  el("newmail-to").focus();
+}
+
+function closeNewMail() {
+  el("newmail").hidden = true;
+  for (const id of ["newmail-to", "newmail-cc", "newmail-subject", "newmail-body"]) el(id).value = "";
+  clearFiles("newmail");
+  showEmpty();
+}
+
+function splitAddresses(text) {
+  return text.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+}
+
+async function sendNewMail(ev) {
+  ev.preventDefault();
+  const to = splitAddresses(el("newmail-to").value);
+  if (to.length === 0) {
+    toast("Add at least one address in To.", "error");
+    el("newmail-to").focus();
+    return;
+  }
+  if (!el("newmail-body").value.trim()) {
+    toast("Write something first.", "error");
+    el("newmail-body").focus();
+    return;
+  }
+  if (filesTooBig("newmail")) {
+    toast("The attachments are larger than 20 MB together; remove some first.", "error");
+    return;
+  }
+  const button = ev.submitter || el("newmail").querySelector("button[type=submit]");
+  button.disabled = true;
+  document.body.classList.add("busy");
+  try {
+    const res = await sendWithFiles("/api/send", "newmail", {
+      account: el("newmail-from").value,
+      to,
+      cc: splitAddresses(el("newmail-cc").value),
+      subject: el("newmail-subject").value,
+      body: el("newmail-body").value,
+    });
+    for (const w of res.warnings || []) toast(w, "warn");
+    toast(`Sent to ${to.join(", ")}.`);
+    closeNewMail();
+  } catch (err) {
+    report(err);
+  } finally {
+    button.disabled = false;
+    document.body.classList.remove("busy");
+  }
+}
+
 /* ---------- modal -------------------------------------------------------- */
 
 function openModal(title, build) {
@@ -487,7 +946,12 @@ function closeModal() {
 
 function askDelay() {
   if (!currentID()) return;
-  openModal("Delay this message for how long?", (body, done) => {
+  askDays("Delay this message for how long?", (days) => actionDelay(days).catch(report));
+}
+
+// askDays offers a delay in days and calls pick with the choice.
+function askDays(title, pick) {
+  openModal(title, (body, done) => {
     const choices = document.createElement("div");
     choices.className = "choices";
     for (const days of [1, 3, 7, 14, 30, 90]) {
@@ -496,7 +960,7 @@ function askDelay() {
       b.textContent = days === 1 ? "1 day" : `${days} days`;
       b.addEventListener("click", () => {
         done();
-        actionDelay(days).catch(report);
+        pick(days);
       });
       choices.append(b);
     }
@@ -523,7 +987,7 @@ function askDelay() {
         return;
       }
       done();
-      actionDelay(days).catch(report);
+      pick(days);
     });
     body.append(custom);
   });
@@ -659,6 +1123,10 @@ function onKey(ev) {
       el("compose").hidden = true;
       return;
     }
+    if (!el("newmail").hidden && !isTyping(ev.target)) {
+      closeNewMail();
+      return;
+    }
     if (isTyping(ev.target)) ev.target.blur();
     return;
   }
@@ -693,6 +1161,13 @@ function onKey(ev) {
       ev.preventDefault();
       askMove();
       break;
+    case "x":
+      ev.preventDefault();
+      if (bulkAllowed() && state.selected >= 0 && state.selected < state.items.length) {
+        const id = state.items[state.selected].id;
+        toggleChecked(id, !(state.allResults || state.checked.has(id)));
+      }
+      break;
     case "#":
     case "Delete":
       ev.preventDefault();
@@ -701,6 +1176,10 @@ function onKey(ev) {
     case "g":
       ev.preventDefault();
       refresh().catch(report);
+      break;
+    case "c":
+      ev.preventDefault();
+      openNewMail();
       break;
     case "/":
       ev.preventDefault();
@@ -723,17 +1202,41 @@ function debounce(fn, ms) {
 
 function wire() {
   el("refresh").addEventListener("click", () => refresh().catch(report));
+  el("new-mail").addEventListener("click", openNewMail);
+  el("newmail").addEventListener("submit", (ev) => { sendNewMail(ev).catch(report); });
+  el("newmail-cancel").addEventListener("click", closeNewMail);
+  wireAttachments("newmail");
+  wireAttachments("compose");
   el("archive-all").addEventListener("click", confirmArchiveAll);
+  el("empty-trash").addEventListener("click", confirmEmptyTrash);
+  el("select-page").addEventListener("change", (ev) => togglePage(ev.target.checked));
+  el("bulk-all").addEventListener("click", () => {
+    state.allResults = true;
+    renderList();
+  });
+  el("bulk-move").addEventListener("click", askBulkMove);
+  el("bulk-prio").addEventListener("click", () => bulkMoveTo("priority"));
+  el("bulk-delay").addEventListener("click", askBulkDelay);
+  el("bulk-ignore").addEventListener("click", askBulkIgnore);
+  el("bulk-read").addEventListener("click", () => bulkRead(true));
+  el("bulk-unread").addEventListener("click", () => bulkRead(false));
+  el("bulk-delete").addEventListener("click", confirmBulkDelete);
+  el("bulk-clear").addEventListener("click", () => {
+    clearChecked();
+    renderList();
+  });
 
   el("search").addEventListener("input", debounce((ev) => {
     state.query = ev.target.value.trim();
     state.offset = 0;
+    clearChecked();
     loadList().catch(report);
   }, 200));
 
   el("unread-only").addEventListener("change", (ev) => {
     state.unreadOnly = ev.target.checked;
     state.offset = 0;
+    clearChecked();
     loadList().catch(report);
   });
 
@@ -770,6 +1273,7 @@ function wire() {
         case "delay": askDelay(); break;
         case "move": askMove(); break;
         case "delete": actionDelete().catch(report); break;
+        case "delete-sender": confirmDeleteSender(); break;
         default: break;
       }
     });

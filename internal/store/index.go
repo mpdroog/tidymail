@@ -301,6 +301,62 @@ type Query struct {
 // maxLimit caps a page so a crafted request cannot pull the whole mailbox.
 const maxLimit = 500
 
+// filter returns the FROM and WHERE parts of a query, and its arguments.
+// search reports whether it joins the full-text table.
+func (q Query) filter() (from, cond string, args []any, search bool) {
+	var where []string
+	if q.Box != "" {
+		where = append(where, "m.box = ?")
+		args = append(args, q.Box)
+	}
+	if q.UnreadOnly {
+		where = append(where, "m.unread = 1")
+	}
+	from = "messages m"
+	if fts := ftsQuery(q.Text); fts != "" {
+		from = "messages m JOIN messages_fts f ON f.mid = m.id"
+		where = append(where, "messages_fts MATCH ?")
+		args = append(args, fts)
+		search = true
+	}
+	if len(where) > 0 {
+		cond = " WHERE " + strings.Join(where, " AND ")
+	}
+	return from, cond, args, search
+}
+
+// MatchingIDs returns every message id a query matches, without paging.
+func (i *index) MatchingIDs(ctx context.Context, q Query) ([]string, error) {
+	from, cond, args, _ := q.filter()
+	return i.queryIDs(ctx, `SELECT m.id FROM `+from+cond, args...)
+}
+
+// Delete removes a message's rows from the index.
+func (i *index) Delete(ctx context.Context, id string) (err error) {
+	tx, err := i.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin index delete: %w", err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			err = fmt.Errorf("%w (and rollback: %w)", err, rbErr)
+		}
+	}()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("unindex message %s: %w", id, err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM messages_fts WHERE mid = ?`, id); err != nil {
+		return fmt.Errorf("unindex text of %s: %w", id, err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit index delete for %s: %w", id, err)
+	}
+	return nil
+}
+
 // List returns messages matching the query, newest first, plus the total
 // number of matches.
 func (i *index) List(ctx context.Context, q Query) (items []ListItem, total int, err error) {
@@ -309,33 +365,13 @@ func (i *index) List(ctx context.Context, q Query) (items []ListItem, total int,
 		limit = 50
 	}
 
-	var (
-		where []string
-		args  []any
-	)
-	if q.Box != "" {
-		where = append(where, "m.box = ?")
-		args = append(args, q.Box)
-	}
-	if q.UnreadOnly {
-		where = append(where, "m.unread = 1")
-	}
-
-	from := "messages m"
+	from, cond, args, search := q.filter()
 	sel := `m.id, m.box, m.from_name, m.from_addr, m.to_addrs, m.subject, m.date_unix,
 		m.size, m.attachments, m.unread, m.delayed_until, ''`
-	if fts := ftsQuery(q.Text); fts != "" {
-		from = "messages m JOIN messages_fts f ON f.mid = m.id"
+	if search {
 		sel = `m.id, m.box, m.from_name, m.from_addr, m.to_addrs, m.subject, m.date_unix,
 			m.size, m.attachments, m.unread, m.delayed_until,
 			snippet(messages_fts, 3, '', '', '…', 14)`
-		where = append(where, "messages_fts MATCH ?")
-		args = append(args, fts)
-	}
-
-	cond := ""
-	if len(where) > 0 {
-		cond = " WHERE " + strings.Join(where, " AND ")
 	}
 
 	if err = i.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+from+cond, args...).Scan(&total); err != nil {
@@ -343,6 +379,7 @@ func (i *index) List(ctx context.Context, q Query) (items []ListItem, total int,
 	}
 
 	args = append(args, limit, q.Offset)
+	// #nosec G202 -- sel, from and cond are fixed SQL from filter; values are bound
 	rows, err := i.db.QueryContext(ctx, `SELECT `+sel+` FROM `+from+cond+` ORDER BY m.date_unix DESC, m.id LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list messages: %w", err)

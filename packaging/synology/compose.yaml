@@ -1,0 +1,27 @@
+# Container Manager project: Project > Create, path /docker/tidymail.
+#
+# mail.d sits next to this file. The web UI is published on the NAS's own
+# 127.0.0.1 only: not on the home network, since tidymail has no login.
+# Tailscale on the NAS (userspace networking, its default on DSM) hands
+# connections to its Tailscale address to 127.0.0.1, so your devices on
+# Tailscale reach it at http://<nas>:8080 and nobody else does.
+services:
+  serve:
+    build: .
+    image: tidymail:local
+    command: ["tidymail", "-dir", "/data", "serve"]
+    volumes:
+      - ./mail.d:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
+  sync:
+    image: tidymail:local
+    depends_on:
+      - serve
+    # Fetch new mail every minute, like the launch agent on the Mac.
+    command: ["sh", "-c", "while true; do tidymail -dir /data sync; sleep 60; done"]
+    volumes:
+      - ./mail.d:/data
+    restart: unless-stopped

@@ -113,7 +113,21 @@ From any box, on any message:
 | `m` | Move    | any box, and optionally a standing rule so this sender always lands there |
 | `#` | Delete  | moves to **Trash**, and to the Trash folder on your IMAP account |
 
-Other keys: `j`/`k` next/previous, `/` search, `g` refresh, `Esc` back out.
+Other keys: `j`/`k` next/previous, `x` tick for bulk delete, `/` search, `g`
+refresh, `Esc` back out.
+
+### Acting on many messages at once
+
+- **Tick boxes** in the list (or `x`), or the box in the list head for the whole
+  page; then **Select all N** extends it to every page of the box or search.
+  The whole selection can then be moved, prioritised, delayed, ignored, marked
+  read or unread, or deleted (moved to Trash). In Trash, **Delete for good**
+  removes the ticked messages.
+- **Delete all from sender** on an open message moves everything from that
+  address, in every box, to Trash.
+- **Empty trash**, in the Trash box, removes its mail from this computer for
+  good. Mail servers are not touched. The ids go to `purged.txt`, so sync never
+  stores that mail again.
 
 Custom boxes are added in the sidebar. "Error mails" is the obvious one: make
 the box, then use **Move → Rule → Error mails** on a message from your CI, and
@@ -153,6 +167,7 @@ mail.d/
   boxes.toml             box definitions
   rules.toml             address -> box routing
   contacts.txt           the whitelist, one address per line
+  purged.txt             messages removed with Empty trash, never fetched again
   sync-<account>.json    IMAP cursor per account (UIDVALIDITY, last UID seen)
   secrets/               password files (gitignored)
   mail/2026/08/<id>.eml  the raw message, never modified

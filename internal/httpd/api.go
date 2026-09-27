@@ -25,11 +25,12 @@ type boxView struct {
 
 // stateView is everything the UI needs to draw its chrome.
 type stateView struct {
-	CSRF     string       `json:"csrf"`
-	Boxes    []boxView    `json:"boxes"`
-	Rules    []store.Rule `json:"rules"`
-	Stats    store.Stats  `json:"stats"`
-	FromAddr string       `json:"from_addr"`
+	CSRF     string        `json:"csrf"`
+	Boxes    []boxView     `json:"boxes"`
+	Rules    []store.Rule  `json:"rules"`
+	Stats    store.Stats   `json:"stats"`
+	FromAddr string        `json:"from_addr"`
+	Accounts []accountView `json:"accounts"` // what a new message can be sent from
 }
 
 func (s *Server) boxViews(ctx context.Context) ([]boxView, error) {
@@ -67,6 +68,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		Rules:    s.st.Rules(),
 		Stats:    stats,
 		FromAddr: fromAddr,
+		Accounts: s.accountViews(),
 	})
 }
 
@@ -342,7 +344,8 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 		Cc    []string `json:"cc"`
 		Quote bool     `json:"quote"`
 	}
-	if err := decodeJSON(r, &req); err != nil {
+	atts, err := s.decodeCompose(r, &req)
+	if err != nil {
 		s.fail(w, r, http.StatusBadRequest, err)
 		return
 	}
@@ -371,12 +374,13 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reply := smtpsend.Reply{
-		To:         targets,
-		Cc:         parseAddresses(req.Cc),
-		Subject:    m.ReplySubject(),
-		Body:       req.Body,
-		InReplyTo:  m.Mail.MessageID,
-		References: append(append([]string{}, m.Mail.References...), m.Mail.InReplyTo),
+		To:          targets,
+		Cc:          parseAddresses(req.Cc),
+		Subject:     m.ReplySubject(),
+		Body:        req.Body,
+		InReplyTo:   m.Mail.MessageID,
+		Attachments: atts,
+		References:  append(append([]string{}, m.Mail.References...), m.Mail.InReplyTo),
 	}
 	if req.Quote {
 		body, rawErr := s.st.Raw(id)

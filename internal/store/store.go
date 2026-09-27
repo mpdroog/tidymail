@@ -29,6 +29,7 @@ type Store struct {
 	boxes    []Box
 	rules    []Rule
 	contacts map[string]struct{}
+	purged   map[string]struct{} // ids removed by EmptyTrash, never stored again
 
 	// Cumulative cost of the expensive steps, reported through Timings.
 	parseNanos atomic.Int64
@@ -59,6 +60,9 @@ func Open(ctx context.Context, dir string, logger *log.Logger) (s *Store, err er
 	}
 	if contactErr := s.loadContacts(); contactErr != nil {
 		return nil, contactErr
+	}
+	if purgedErr := s.loadPurged(); purgedErr != nil {
+		return nil, purgedErr
 	}
 
 	idx, err := openIndex(ctx, s.abs(indexFile))

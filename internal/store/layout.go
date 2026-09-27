@@ -9,6 +9,7 @@
 //	  boxes.toml             box definitions
 //	  rules.toml             address -> box routing rules
 //	  contacts.txt           addresses we have written to (the whitelist)
+//	  purged.txt             ids removed by Empty trash, never stored again
 //	  sync.json              IMAP cursor state (sync-<account>.json per named account)
 //	  mail/YYYY/MM/<id>.eml  raw RFC 5322 message, immutable
 //	  mail/YYYY/MM/<id>.txt  extracted plain text, immutable

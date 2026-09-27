@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -476,5 +478,135 @@ func TestAccountsKeepTheirOwnCursorAndMoves(t *testing.T) {
 	}
 	if !stats.LastSync.Equal(synced) {
 		t.Errorf("last sync = %s, want the latest of any account (%s)", stats.LastSync, synced)
+	}
+}
+
+func TestMoveManyAndMatchingIDs(t *testing.T) {
+	ctx := t.Context()
+	s := testStore(t)
+	var ids []string
+	for _, subject := range []string{"newsletter one", "newsletter two", "invoice"} {
+		m, _, err := s.Ingest(ctx, "", rawMail("news@example.com", "me@example.com", strings.ReplaceAll(subject, " ", "-"), subject), time.Now())
+		if err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		ids = append(ids, m.ID)
+	}
+
+	matched, err := s.MatchingIDs(ctx, Query{Box: BoxUnprocessed, Text: "newsletter", Limit: 1})
+	if err != nil {
+		t.Fatalf("MatchingIDs: %v", err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("matched %d, want both newsletters regardless of the page limit", len(matched))
+	}
+
+	// A missing id is skipped, one already in Trash is not counted twice.
+	moved, err := s.MoveMany(ctx, append(matched, "0123456789abcdef0123456789abcdef"), BoxTrash)
+	if err != nil || moved != 2 {
+		t.Fatalf("MoveMany = %d, %v; want 2", moved, err)
+	}
+	if again, againErr := s.MoveMany(ctx, matched, BoxTrash); againErr != nil || again != 0 {
+		t.Fatalf("second MoveMany = %d, %v; want 0", again, againErr)
+	}
+	if left, getErr := s.Get(ids[2]); getErr != nil || left.Box != BoxUnprocessed {
+		t.Fatalf("invoice = %+v, %v; want it untouched", left, getErr)
+	}
+	if _, badErr := s.MoveMany(ctx, matched, "nowhere"); badErr == nil {
+		t.Fatal("MoveMany to an unknown box should fail")
+	}
+}
+
+func TestEmptyTrashRemovesForGoodAndIsNeverRefetched(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	s, err := Open(ctx, dir, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	raw := rawMail("spam@bad.example", "me@example.com", "junk", "buy now")
+	junk, _, err := s.Ingest(ctx, "", raw, time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	kept, _, err := s.Ingest(ctx, "", rawMail("ann@example.com", "me@example.com", "keep", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if _, moveErr := s.SetBox(ctx, junk.ID, BoxTrash); moveErr != nil {
+		t.Fatalf("SetBox: %v", moveErr)
+	}
+
+	removed, err := s.EmptyTrash(ctx)
+	if err != nil || removed != 1 {
+		t.Fatalf("EmptyTrash = %d, %v; want 1", removed, err)
+	}
+	if _, getErr := s.Get(junk.ID); getErr == nil {
+		t.Fatal("emptied message still has a state file")
+	}
+	for _, p := range []string{junk.Mail.EML, junk.Mail.TXT} {
+		if _, statErr := os.Stat(filepath.Join(dir, filepath.FromSlash(p))); !os.IsNotExist(statErr) {
+			t.Errorf("%s still on disk (stat: %v)", p, statErr)
+		}
+	}
+	if items, total, listErr := s.List(ctx, Query{Text: "buy"}); listErr != nil || total != 0 {
+		t.Fatalf("search after empty = %+v (%d), %v; want nothing", items, total, listErr)
+	}
+	if _, getErr := s.Get(kept.ID); getErr != nil {
+		t.Fatalf("message outside Trash was touched: %v", getErr)
+	}
+	if closeErr := s.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
+	}
+
+	// After a restart, a sync that meets the same mail again skips it.
+	s, err = Open(ctx, dir, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := s.Close(); closeErr != nil {
+			t.Errorf("Close: %v", closeErr)
+		}
+	})
+	m, isNew, err := s.Ingest(ctx, "", raw, time.Now())
+	if err != nil || isNew || m != nil {
+		t.Fatalf("re-ingest of emptied mail = %+v, new=%v, %v; want it skipped", m, isNew, err)
+	}
+	if n, emptyErr := s.EmptyTrash(ctx); emptyErr != nil || n != 0 {
+		t.Fatalf("emptying an empty Trash = %d, %v", n, emptyErr)
+	}
+}
+
+func TestPurgeFromTrashOnlyTouchesTrash(t *testing.T) {
+	ctx := t.Context()
+	s := testStore(t)
+	trashed, _, err := s.Ingest(ctx, "", rawMail("a@example.com", "me@example.com", "old", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	alsoTrashed, _, err := s.Ingest(ctx, "", rawMail("b@example.com", "me@example.com", "older", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	inbox, _, err := s.Ingest(ctx, "", rawMail("c@example.com", "me@example.com", "keep", "body"), time.Now())
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if _, moveErr := s.MoveMany(ctx, []string{trashed.ID, alsoTrashed.ID}, BoxTrash); moveErr != nil {
+		t.Fatalf("MoveMany: %v", moveErr)
+	}
+
+	removed, err := s.PurgeFromTrash(ctx, []string{trashed.ID, inbox.ID, "0123456789abcdef0123456789abcdef"})
+	if err != nil || removed != 1 {
+		t.Fatalf("PurgeFromTrash = %d, %v; want only the one ticked Trash message", removed, err)
+	}
+	if _, getErr := s.Get(trashed.ID); getErr == nil {
+		t.Error("purged message is still there")
+	}
+	for _, id := range []string{alsoTrashed.ID, inbox.ID} {
+		if _, getErr := s.Get(id); getErr != nil {
+			t.Errorf("%s should be untouched: %v", id, getErr)
+		}
 	}
 }

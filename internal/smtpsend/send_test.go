@@ -1,6 +1,7 @@
 package smtpsend
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -110,5 +111,42 @@ func TestRecipientsIncludesCc(t *testing.T) {
 	})
 	if len(got) != 3 {
 		t.Fatalf("Recipients = %v, want 3 envelope recipients", got)
+	}
+}
+
+func TestComposeWithAttachments(t *testing.T) {
+	s := testSender()
+	pdf := []byte("%PDF-1.4 not really a pdf")
+	raw, err := s.Compose(Reply{
+		To:      []mailparse.Address{{Address: "ann@example.com"}},
+		Subject: "Files",
+		Body:    "Two files attached.",
+		Attachments: []Attachment{
+			{Filename: "report.pdf", ContentType: "application/pdf", Data: pdf},
+			{Filename: "notes €.txt", Data: []byte("plain notes")},
+		},
+	}, time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	parsed, err := mailparse.Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !strings.Contains(parsed.Text, "Two files attached.") {
+		t.Errorf("text = %q, want the body", parsed.Text)
+	}
+	if len(parsed.Attachments) != 2 {
+		t.Fatalf("attachments = %+v, want 2", parsed.Attachments)
+	}
+	if parsed.Attachments[0].Filename != "report.pdf" || parsed.Attachments[1].Filename != "notes €.txt" {
+		t.Errorf("filenames = %q, %q", parsed.Attachments[0].Filename, parsed.Attachments[1].Filename)
+	}
+	name, ctype, data, err := mailparse.AttachmentBody(raw, parsed.Attachments[0].Part)
+	if err != nil {
+		t.Fatalf("AttachmentBody: %v", err)
+	}
+	if name != "report.pdf" || !strings.HasPrefix(ctype, "application/pdf") || !bytes.Equal(data, pdf) {
+		t.Errorf("attachment = %q %q %q, want the PDF back byte for byte", name, ctype, data)
 	}
 }

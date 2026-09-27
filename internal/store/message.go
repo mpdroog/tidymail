@@ -166,11 +166,16 @@ func (s *Store) Get(id string) (*Message, error) {
 
 // Ingest stores a raw message fetched through account and files it into a
 // box. It reports whether the message was new; re-ingesting identical bytes is
-// a no-op, which is what makes a failed server-side archive safe to retry.
+// a no-op, which is what makes a failed server-side archive safe to retry. A
+// message removed with EmptyTrash is not stored again: Ingest returns nil,
+// false and no error, so sync treats it as done.
 func (s *Store) Ingest(ctx context.Context, account string, raw []byte, received time.Time) (*Message, bool, error) {
 	id := messageID(raw)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.isPurgedLocked(id) {
+		return nil, false, nil
+	}
 
 	existing, err := s.readState(id)
 	if err == nil {

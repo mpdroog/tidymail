@@ -13,6 +13,7 @@
   <nav class="sidebar">
     <div class="brand">
       <span class="brand-name">tidymail</span>
+      <button type="button" id="new-mail" class="primary" title="Write a new message (c)">New</button>
       <button type="button" id="refresh" class="ghost" title="Show mail fetched by tidymail sync (g)">Refresh</button>
     </div>
 
@@ -32,8 +33,22 @@
       <label class="toggle"><input type="checkbox" id="unread-only"> unread</label>
     </div>
     <div class="list-head">
+      <input type="checkbox" id="select-page" title="Select every message on this page (x toggles one)" aria-label="Select page">
       <span id="list-head"></span>
       <button type="button" id="archive-all" class="ghost small" title="Move everything in Unprocessed to Processed" hidden>Archive all</button>
+      <button type="button" id="empty-trash" class="small danger solid" title="Remove everything in Trash from this computer for good" hidden>Empty trash</button>
+      <span class="bulkbar" id="bulkbar" hidden>
+        <span id="bulk-count"></span>
+        <button type="button" id="bulk-all" class="ghost small" hidden></button>
+        <button type="button" id="bulk-move" class="small">Move…</button>
+        <button type="button" id="bulk-prio" class="small">Prio</button>
+        <button type="button" id="bulk-delay" class="small">Delay…</button>
+        <button type="button" id="bulk-ignore" class="small">Ignore</button>
+        <button type="button" id="bulk-read" class="small">Read</button>
+        <button type="button" id="bulk-unread" class="small">Unread</button>
+        <button type="button" id="bulk-delete" class="small danger">Delete</button>
+        <button type="button" id="bulk-clear" class="ghost small">Clear</button>
+      </span>
     </div>
     <ul class="messages" id="messages"></ul>
     <div class="pager">
@@ -53,7 +68,9 @@
         <dt>p</dt><dd>priority</dd>
         <dt>d</dt><dd>delay for N days</dd>
         <dt>m</dt><dd>move to a box</dd>
-        <dt>#</dt><dd>delete: to Trash, also on IMAP</dd>
+        <dt>#</dt><dd>delete: to Trash</dd>
+        <dt>x</dt><dd>tick for bulk delete</dd>
+        <dt>c</dt><dd>new message</dd>
         <dt>/</dt><dd>search</dd>
         <dt>g</dt><dd>refresh</dd>
       </dl>
@@ -78,13 +95,31 @@
         <button type="button" data-act="prio">Prio <kbd>p</kbd></button>
         <button type="button" data-act="delay">Delay <kbd>d</kbd></button>
         <button type="button" data-act="move">Move <kbd>m</kbd></button>
-        <button type="button" data-act="delete" class="danger" title="Move to Trash, here and on the IMAP server">Delete <kbd>#</kbd></button>
+        <button type="button" data-act="delete" class="danger" title="Move to Trash">Delete <kbd>#</kbd></button>
+        <button type="button" data-act="delete-sender" class="danger" title="Move every message from this sender to Trash">Delete all from sender</button>
         <a id="msg-raw" class="button ghost" href="#" download>Source</a>
       </div>
 
       <ul class="attachments" id="attachments"></ul>
       <pre class="body" id="msg-body"></pre>
     </article>
+
+    <form class="compose newmail" id="newmail" hidden>
+      <div class="compose-head">
+        <strong>New message</strong>
+        <button type="button" id="newmail-cancel" class="ghost">Cancel</button>
+      </div>
+      <label class="field"><span>From</span><select id="newmail-from"></select></label>
+      <label class="field"><span>To</span><input type="text" id="newmail-to" placeholder="ann@example.com, bob@example.com" autocomplete="off"></label>
+      <label class="field"><span>Cc</span><input type="text" id="newmail-cc" placeholder="optional" autocomplete="off"></label>
+      <label class="field"><span>Subject</span><input type="text" id="newmail-subject" autocomplete="off"></label>
+      <textarea id="newmail-body" rows="16" placeholder="Your message…"></textarea>
+      <ul class="files" id="newmail-files"></ul>
+      <div class="compose-foot">
+        <label class="button ghost attach">Attach… <input type="file" id="newmail-attach" multiple></label>
+        <button type="submit" class="primary">Send</button>
+      </div>
+    </form>
 
     <form class="compose" id="compose" hidden>
       <div class="compose-head">
@@ -93,8 +128,10 @@
       </div>
       <input type="text" id="compose-cc" placeholder="Cc (comma separated)" autocomplete="off">
       <textarea id="compose-body" rows="14" placeholder="Your reply…"></textarea>
+      <ul class="files" id="compose-files"></ul>
       <div class="compose-foot">
         <label class="toggle"><input type="checkbox" id="compose-quote" checked> quote original</label>
+        <label class="button ghost attach">Attach… <input type="file" id="compose-attach" multiple></label>
         <button type="submit" class="primary">Send &amp; mark processed</button>
       </div>
     </form>

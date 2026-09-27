@@ -86,7 +86,11 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .brand-name {
   font-weight: 600;
   letter-spacing: 0.02em;
+  margin-right: auto;
 }
+
+/* New and Refresh share the narrow sidebar with the name. */
+.brand button { padding: 3px 9px; font-size: 12px; white-space: nowrap; }
 
 .boxes {
   list-style: none;
@@ -222,6 +226,22 @@ button, input, textarea, select { font: inherit; color: inherit; }
 }
 
 .messages li:hover { background: var(--pane-alt); }
+
+/* Bulk selection: a tick box at the start of every row. */
+.messages.checkable li { position: relative; padding-left: 36px; }
+.row-check { position: absolute; left: 12px; top: 11px; margin: 0; cursor: pointer; }
+#select-page { margin: 0 6px 0 3px; cursor: pointer; }
+.list-head #list-head { flex: 1; }
+
+/* While messages are ticked the bulk controls take over the list head, in
+   place, so the rows under the pointer never move. */
+.list-head.bulk { background: var(--sel); }
+.list-head.bulk #list-head,
+.list-head.bulk #archive-all,
+.list-head.bulk #empty-trash { display: none; }
+.bulkbar { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; }
+.bulkbar #bulk-count { flex: 1; font-weight: 600; color: var(--ink); }
+button.danger.solid { background: var(--danger); border-color: var(--danger); color: var(--pane); }
 
 .messages li[aria-selected="true"] {
   background: var(--sel);
@@ -383,6 +403,24 @@ li.unread { border-left-color: var(--accent); }
 }
 
 /* --- compose ------------------------------------------------------------ */
+
+.newmail .field { display: flex; align-items: center; gap: 10px; }
+
+/* Attachments: the file input hides inside its label, which looks like a button. */
+.attach { position: relative; cursor: pointer; }
+.attach input[type="file"] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.files { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.files:empty { display: none; }
+.files li {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 4px 2px 9px; font-size: 12px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--pane);
+}
+.files li.too-big { border-color: var(--danger); color: var(--danger); }
+.files button { padding: 0 6px; border: none; background: none; }
+.compose.dropping { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.newmail .field span { width: 60px; font-size: 12px; color: var(--ink-soft); }
+.newmail .field input, .newmail .field select { flex: 1; min-width: 0; }
 
 .compose {
   display: flex;

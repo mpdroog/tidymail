@@ -213,7 +213,7 @@ func (s *Store) Ingest(ctx context.Context, account string, raw []byte, received
 	m := &Message{
 		ID:      id,
 		Account: account,
-		Box:     s.routeLocked(from.Address, recipients),
+		Box:     s.routeLocked(from.Address, recipients, parsed.Subject),
 		// As fetched: the folder sync found it in. A rule filing it elsewhere
 		// makes serve move it there on the server too.
 		ServerBox: BoxUnprocessed,

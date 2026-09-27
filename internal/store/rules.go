@@ -21,11 +21,15 @@ const (
 	MatchFrom MatchField = "from"
 	MatchTo   MatchField = "to"
 	MatchAny  MatchField = "any"
+	// MatchSubject matches a word or phrase anywhere in the subject,
+	// ignoring case. Address then holds that text, not an address.
+	MatchSubject MatchField = "subject"
 )
 
-// Rule routes incoming mail to a box based on an address or a domain.
-// Address is either a full address ("ci@example.com") or a domain suffix
-// written with a leading "@" ("@example.com").
+// Rule routes incoming mail to a box based on an address, a domain or a word
+// in the subject. Address is either a full address ("ci@example.com"), a
+// domain suffix written with a leading "@" ("@example.com"), or for
+// match = "subject" the text to look for ("invoice").
 type Rule struct {
 	Field   MatchField `toml:"match" json:"match"`
 	Address string     `toml:"address" json:"address"`
@@ -51,9 +55,11 @@ func normalizeAddress(addr string) string {
 func (r Rule) key() string { return string(r.Field) + "\x00" + r.Address }
 
 // matches reports whether the rule applies to a message with the given
-// sender and recipients.
-func (r Rule) matches(from string, recipients []string) bool {
+// sender, recipients and subject.
+func (r Rule) matches(from string, recipients []string, subject string) bool {
 	switch r.Field {
+	case MatchSubject:
+		return r.Address != "" && strings.Contains(strings.ToLower(subject), r.Address)
 	case MatchFrom:
 		return addressMatches(r.Address, from)
 	case MatchTo:
@@ -110,7 +116,7 @@ func (s *Store) loadRules() error {
 	for _, r := range rf.Rule {
 		r.Address = normalizeAddress(r.Address)
 		switch r.Field {
-		case MatchFrom, MatchTo, MatchAny:
+		case MatchFrom, MatchTo, MatchAny, MatchSubject:
 		case "":
 			r.Field = MatchFrom
 		default:
@@ -144,7 +150,9 @@ func (s *Store) saveRulesLocked() error {
 	})
 	var buf bytes.Buffer
 	buf.WriteString("# tidymail routing rules: incoming mail matching a rule lands in that box.\n")
-	buf.WriteString("# address may be a full address or a domain such as \"@example.com\".\n\n")
+	buf.WriteString("# address may be a full address or a domain such as \"@example.com\".\n")
+	buf.WriteString("# With match = \"subject\", address is a word or phrase to find in the subject.\n")
+	buf.WriteString("# Address rules are tried before subject rules.\n\n")
 	if err := toml.NewEncoder(&buf).Encode(ruleFile{Rule: sorted}); err != nil {
 		return fmt.Errorf("encode %s: %w", rulesFile, err)
 	}
@@ -168,9 +176,9 @@ func (s *Store) AddRule(r Rule) error {
 		return fmt.Errorf("%w: address is required", ErrInvalidRule)
 	}
 	switch r.Field {
-	case MatchFrom, MatchTo, MatchAny:
+	case MatchFrom, MatchTo, MatchAny, MatchSubject:
 	default:
-		return fmt.Errorf("%w: match %q: want from, to or any", ErrInvalidRule, r.Field)
+		return fmt.Errorf("%w: match %q: want from, to, any or subject", ErrInvalidRule, r.Field)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,11 +239,18 @@ func (s *Store) dropRulesForBoxLocked(box string) error {
 }
 
 // routeLocked decides which box a newly ingested message belongs in. Rules win
-// over the whitelist; without either it is unprocessed.
-func (s *Store) routeLocked(from string, recipients []string) string {
-	for _, r := range s.rules {
-		if r.matches(from, recipients) && s.hasBoxLocked(r.Box) {
-			return r.Box
+// over the whitelist; without either it is unprocessed. Address rules are
+// tried before subject rules, so a blacklisted sender stays in Spam even when
+// its subject says "invoice".
+func (s *Store) routeLocked(from string, recipients []string, subject string) string {
+	for _, subjectPass := range []bool{false, true} {
+		for _, r := range s.rules {
+			if (r.Field == MatchSubject) != subjectPass {
+				continue
+			}
+			if r.matches(from, recipients, subject) && s.hasBoxLocked(r.Box) {
+				return r.Box
+			}
 		}
 	}
 	if _, ok := s.contacts[from]; ok {
@@ -385,7 +400,7 @@ func (s *Store) ApplyRule(ctx context.Context, r Rule) (int, error) {
 		for _, a := range m.Mail.Cc {
 			recipients = append(recipients, a.Address)
 		}
-		if !r.matches(m.Mail.From.Address, recipients) {
+		if !r.matches(m.Mail.From.Address, recipients, m.Mail.Subject) {
 			continue
 		}
 		if err := s.setBoxLocked(ctx, id, r.Box, m.Box, 0); err != nil {

@@ -235,6 +235,36 @@ func TestRuleBeatsWhitelist(t *testing.T) {
 	}
 }
 
+func TestSubjectRule(t *testing.T) {
+	ctx := t.Context()
+	s := testStore(t)
+	if _, err := s.CreateBox("Invoices"); err != nil {
+		t.Fatalf("CreateBox: %v", err)
+	}
+	for _, r := range []Rule{
+		{Field: MatchSubject, Address: "Invoice", Box: "invoices"},
+		{Field: MatchFrom, Address: "spammer@example.com", Box: BoxSpam},
+	} {
+		if err := s.AddRule(r); err != nil {
+			t.Fatalf("AddRule: %v", err)
+		}
+	}
+	for _, tc := range []struct{ from, subject, want string }{
+		{"billing@shop.example", "Your INVOICE #123", "invoices"},
+		{"ann@example.com", "lunch?", BoxUnprocessed},
+		// Address rules are tried first: a blacklisted sender stays in Spam.
+		{"spammer@example.com", "invoice overdue", BoxSpam},
+	} {
+		m, _, err := s.Ingest(ctx, "", rawMail(tc.from, "me@example.com", tc.subject, "body"), time.Now())
+		if err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		if m.Box != tc.want {
+			t.Errorf("%s %q: box = %q, want %q", tc.from, tc.subject, m.Box, tc.want)
+		}
+	}
+}
+
 func TestDelayReturnsToOriginalBox(t *testing.T) {
 	ctx := t.Context()
 	s := testStore(t)

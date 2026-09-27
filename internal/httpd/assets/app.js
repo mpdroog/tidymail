@@ -1028,6 +1028,35 @@ function askMove() {
       ruleRow.append(b);
     }
     body.append(ruleRow);
+
+    const subjNote = document.createElement("p");
+    subjNote.textContent = "Or: always send mail whose subject contains…";
+    body.append(subjNote);
+
+    const subj = document.createElement("input");
+    subj.type = "text";
+    subj.placeholder = "invoice";
+    subj.setAttribute("aria-label", "Word in the subject");
+    body.append(subj);
+
+    const subjRow = document.createElement("div");
+    subjRow.className = "choices";
+    for (const box of state.boxes.filter((b) => !b.system || b.slug === "spam")) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = `Rule → ${box.name}`;
+      b.addEventListener("click", () => {
+        const word = subj.value.trim();
+        if (!word) {
+          toast("Enter a word from the subject.", "error");
+          return;
+        }
+        done();
+        addRuleForSubject(word, box.slug).catch(report);
+      });
+      subjRow.append(b);
+    }
+    body.append(subjRow);
   });
 }
 
@@ -1071,6 +1100,14 @@ async function addRuleForSender(box) {
     body: { match: "from", address: msg.mail.from.address, box, apply_existing: true },
   });
   await afterAction(res, `Mail from ${msg.mail.from.address} now goes to ${boxName(box)} (${res.moved || 0} moved).`);
+}
+
+async function addRuleForSubject(word, box) {
+  const res = await api("/api/rules", {
+    method: "POST",
+    body: { match: "subject", address: word, box, apply_existing: true },
+  });
+  await afterAction(res, `Mail with "${word}" in the subject now goes to ${boxName(box)} (${res.moved || 0} moved).`);
 }
 
 function confirmDeleteBox(box) {

@@ -95,8 +95,21 @@ D-Bus (`notify = false` turns that off). From cron, where
 Incoming mail is routed on arrival, first match wins:
 
 1. a **rule** matching the sender or a recipient sends it to that rule's box
-2. a sender in `contacts.txt` (someone you have written to) → **Whitelisted**
-3. everything else → **Unprocessed**
+2. a **subject rule** — a word or phrase in the subject, ignoring case — sends
+   it to that rule's box
+3. a sender in `contacts.txt` (someone you have written to) → **Whitelisted**
+4. everything else → **Unprocessed**
+
+Address rules come before subject rules, so a blacklisted sender stays in Spam
+even when the subject says "invoice". Subject rules are made in the Move dialog
+(`m`), or by hand in `rules.toml`:
+
+```toml
+[[rule]]
+match = "subject"
+address = "invoice"
+box = "invoices"
+```
 
 `contacts.txt` fills itself: tidymail scans your IMAP Sent folder on every sync
 and records everyone you have written to, and adds anyone you reply to from
